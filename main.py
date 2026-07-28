@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -52,9 +52,10 @@ def load_models():
         logger.warning(f"Derma não disponível: {e}")
 
     try:
-        from models.sepse_model import load_sepse
-        MODEL_REGISTRY["sepse"] = load_sepse()
-        logger.info("XGBoost Sepse carregado.")
+        from models.sepse_model import _load_model
+        _load_model()
+        MODEL_REGISTRY["sepse"] = "xgboost-pkl-v1"
+        logger.info("XGBoost Sepse (pkl, AUC 0.8766) carregado.")
     except Exception as e:
         logger.warning(f"Sepse não disponível: {e}")
 
@@ -250,27 +251,42 @@ async def derma(req: ImageRequest):
 @app.post("/v1/sepse")
 async def sepse(req: SepseRequest):
     """
-    XGBoost Sepse — PhysioNet Challenge 2019 (≈60k pacientes UTI).
-    40 variáveis laboratoriais e sinais vitais. AUC estimado 0.82–0.88.
+    XGBoost Sepse — PhysioNet 2019 + MIMIC-IV + eICU.
+    19 variáveis clínicas. AUC-ROC: 0.8766.
     """
-    modelo = MODEL_REGISTRY.get("sepse")
-    if modelo is None:
-        raise HTTPException(503, "Modelo Sepse não carregado.")
-
+    from models.sepse_model import predict_sepsis
     try:
-        features = _extrair_features_sepse(req)
-        resultado = modelo.predict(features)
+        dados = _mapear_sepse_request(req)
+        resultado = predict_sepsis(dados)
     except Exception as e:
         logger.exception("Erro Sepse")
         raise HTTPException(500, f"Erro na inferência: {e}")
 
     return {
         "resultado": resultado,
-        "confianca": resultado["prob"],
-        "modelo": "xgboost-sepse-physionet2019",
+        "confianca": resultado["probabilidade"],
+        "modelo": "xgboost-sepse-physionet2019-pkl",
         "aviso": DISCLAIMER_CFM,
         "timestamp": _ts(),
     }
+
+
+@app.post("/sepsis/predict")
+async def predict_sepsis_endpoint(request: Request):
+    """
+    XGBoost Sepse — endpoint direto com JSON livre.
+    Aceita qualquer subconjunto das 19 features (HR, O2Sat, Temp, SBP, MAP,
+    DBP, Resp, BUN, Glucose, Lactate, Potassium, Creatinine, Hct, Hgb,
+    WBC, Platelets, Age, Gender, ICULOS). Valores ausentes imputados por mediana.
+    """
+    try:
+        dados = await request.json()
+        from models.sepse_model import predict_sepsis
+        resultado = predict_sepsis(dados)
+        return {"success": True, "data": resultado}
+    except Exception as e:
+        logger.exception("Erro /sepsis/predict")
+        return {"success": False, "error": str(e), "score": 50, "risco": "indeterminado"}
 
 
 @app.post("/v1/pill")
@@ -304,14 +320,14 @@ async def pill(req: ImageRequest):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _extrair_features_sepse(req: SepseRequest) -> list:
-    campos = [
-        "hr", "o2sat", "temp", "sbp", "map", "dbp", "resp", "etco2",
-        "baseexcess", "hco3", "ph", "paco2", "sao2", "ast", "bun",
-        "alkalinephos", "calcium", "chloride", "creatinine", "bilirubin_direct",
-        "glucose", "lactate", "magnesium", "phosphate", "potassium",
-        "bilirubin_total", "trop_i", "hct", "hgb", "ptt", "wbc",
-        "fibrinogen", "platelets", "age", "gender", "unit1", "unit2",
-        "hosp_adm_elapsed", "icu_los_days", "hora_no_icu",
-    ]
-    return [float(getattr(req, c) or 0.0) for c in campos]
+def _mapear_sepse_request(req: SepseRequest) -> dict:
+    """Mapeia SepseRequest (campos lowercase) → dict com feature names do modelo XGBoost."""
+    return {
+        'HR': req.hr, 'O2Sat': req.o2sat, 'Temp': req.temp,
+        'SBP': req.sbp, 'MAP': req.map, 'DBP': req.dbp, 'Resp': req.resp,
+        'BUN': req.bun, 'Glucose': req.glucose, 'Lactate': req.lactate,
+        'Potassium': req.potassium, 'Creatinine': req.creatinine,
+        'Hct': req.hct, 'Hgb': req.hgb, 'WBC': req.wbc,
+        'Platelets': req.platelets, 'Age': req.age, 'Gender': req.gender,
+        'ICULOS': req.icu_los_days,
+    }

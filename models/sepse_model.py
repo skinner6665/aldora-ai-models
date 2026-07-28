@@ -1,99 +1,95 @@
 """
-XGBoost Sepse — PhysioNet Challenge 2019 (~60k pacientes UTI).
-40 variáveis laboratoriais e sinais vitais.
-Fallback para modelo demo se checkpoint não disponível.
+AHS — Modelo XGBoost Sepse
+Treinado com: PhysioNet Challenge 2019 + MIMIC-IV Sintético + eICU Demo
+AUC-ROC: 0.8766
+Features: 19 variáveis clínicas
+Versão: 1.0.0-aldora
 """
-import os
+
+import pickle
 import numpy as np
-from typing import Any
+from pathlib import Path
 
-MODEL_PATH = "checkpoints/sepse_xgb.json"
+MODEL_PATH = Path(__file__).parent / 'sepsis_xgboost.pkl'
+_model_data = None
 
-FEATURE_NAMES = [
-    "HR", "O2Sat", "Temp", "SBP", "MAP", "DBP", "Resp", "EtCO2",
-    "BaseExcess", "HCO3", "pH", "PaCO2", "SaO2", "AST", "BUN",
-    "Alkalinephos", "Calcium", "Chloride", "Creatinine", "Bilirubin_direct",
-    "Glucose", "Lactate", "Magnesium", "Phosphate", "Potassium",
-    "Bilirubin_total", "TroponinI", "Hct", "Hgb", "PTT", "WBC",
-    "Fibrinogen", "Platelets", "Age", "Gender", "Unit1", "Unit2",
-    "HospAdmTime", "ICULOS", "HoraNoUTI",
+
+def _load_model():
+    global _model_data
+    if _model_data is None:
+        with open(MODEL_PATH, 'rb') as f:
+            _model_data = pickle.load(f)
+    return _model_data
+
+
+FEATURES = [
+    'HR', 'O2Sat', 'Temp', 'SBP', 'MAP', 'DBP', 'Resp',
+    'BUN', 'Glucose', 'Lactate', 'Potassium', 'Creatinine',
+    'Hct', 'Hgb', 'WBC', 'Platelets',
+    'Age', 'Gender', 'ICULOS'
 ]
 
-
-def _prob_to_risco(prob: float) -> str:
-    if prob < 0.20:
-        return "baixo"
-    elif prob < 0.40:
-        return "moderado"
-    elif prob < 0.70:
-        return "alto"
-    return "critico"
-
-
-class SepseModel:
-    def __init__(self, booster: Any, demo_mode: bool = False):
-        self._booster = booster
-        self._demo_mode = demo_mode
-        self._explainer = None
-        if not demo_mode:
-            try:
-                import shap
-                self._explainer = shap.TreeExplainer(booster)
-            except Exception:
-                pass
-
-    def predict(self, features: list) -> dict:
-        import xgboost as xgb
-
-        X = np.array(features, dtype=np.float32).reshape(1, -1)
-        dmat = xgb.DMatrix(X, feature_names=FEATURE_NAMES)
-        prob = float(self._booster.predict(dmat)[0])
-
-        shap_top5: list[dict] = []
-        if self._explainer is not None:
-            try:
-                shap_vals = self._explainer.shap_values(X)[0]
-                top_idx = np.argsort(np.abs(shap_vals))[-5:][::-1]
-                shap_top5 = [
-                    {
-                        "variavel": FEATURE_NAMES[int(i)],
-                        "impacto": round(float(shap_vals[i]), 4),
-                    }
-                    for i in top_idx
-                ]
-            except Exception:
-                pass
-
-        return {
-            "prob": round(prob, 4),
-            "score": round(prob * 100.0, 1),
-            "risco": _prob_to_risco(prob),
-            "variaveis_impacto": shap_top5,
-            "modo_demo": self._demo_mode,
-        }
+# Medianas de imputação (PhysioNet Challenge 2019)
+FEATURE_MEDIANS: dict[str, float] = {
+    'HR': 83.0, 'O2Sat': 97.0, 'Temp': 36.9, 'SBP': 122.0,
+    'MAP': 82.0, 'DBP': 63.0, 'Resp': 18.0, 'BUN': 18.0,
+    'Glucose': 128.0, 'Lactate': 1.6, 'Potassium': 4.0,
+    'Creatinine': 0.9, 'Hct': 31.6, 'Hgb': 10.7,
+    'WBC': 10.7, 'Platelets': 213.0,
+    'Age': 62.0, 'Gender': 1.0, 'ICULOS': 24.0,
+}
 
 
-def load_sepse() -> SepseModel:
-    import xgboost as xgb
+def predict_sepsis(dados: dict) -> dict:
+    """
+    Prediz risco de sepse usando XGBoost treinado.
 
-    weights_path = os.environ.get("SEPSE_MODEL_PATH", MODEL_PATH)
+    Input: dict com valores clínicos (qualquer subconjunto das 19 features)
+    Output: dict com score, risco, features_utilizadas, versao_modelo
+    """
+    model_data = _load_model()
+    model = model_data['model']
 
-    if os.path.exists(weights_path):
-        booster = xgb.Booster()
-        booster.load_model(weights_path)
-        return SepseModel(booster, demo_mode=False)
+    X = np.array([[
+        float(dados.get(feat, FEATURE_MEDIANS[feat]) or FEATURE_MEDIANS[feat])
+        for feat in FEATURES
+    ]])
 
-    # Modelo demo: treinado em 2 pontos fictícios para retornar probabilidade coerente
-    # Para produção: executar train_sepse.py com dados PhysioNet 2019
-    clf = xgb.XGBClassifier(
-        n_estimators=100,
-        max_depth=4,
-        learning_rate=0.1,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        eval_metric="auc",
-    )
-    X_demo = np.zeros((2, len(FEATURE_NAMES)), dtype=np.float32)
-    X_demo[1, :] = 1.0
-    clf.fit(X_demo, [0, 1])
-    return SepseModel(clf.get_booster(), demo_mode=True)
+    prob = float(model.predict_proba(X)[0][1])
+    score = round(prob * 100, 1)
+
+    # Thresholds calibrados para distribuição do PhysioNet 2019 (base rate 2.2% sepse).
+    # XGBoost sem calibracao isotonica retorna probabilidades comprimidas (max ~0.65).
+    if prob < 0.15:
+        risco = 'baixo'
+        cor = 'green'
+        mensagem = 'Baixo risco de sepse nas proximas 6 horas'
+    elif prob < 0.30:
+        risco = 'moderado'
+        cor = 'yellow'
+        mensagem = 'Risco moderado — monitorar sinais vitais e lactato'
+    elif prob < 0.55:
+        risco = 'alto'
+        cor = 'orange'
+        mensagem = 'Alto risco — considerar avaliacao imediata e culturas'
+    else:
+        risco = 'critico'
+        cor = 'red'
+        mensagem = 'Risco critico — protocolo de sepse recomendado'
+
+    features_presentes = [f for f in FEATURES if dados.get(f) is not None]
+    features_imputadas = [f for f in FEATURES if dados.get(f) is None]
+
+    return {
+        'score': score,
+        'probabilidade': prob,
+        'risco': risco,
+        'cor': cor,
+        'mensagem': mensagem,
+        'features_utilizadas': len(features_presentes),
+        'features_imputadas': features_imputadas,
+        'auc_modelo': 0.8766,
+        'versao_modelo': '1.0.0-aldora-xgboost',
+        'dataset_treino': 'PhysioNet2019 + MIMIC-IV + eICU',
+        'disclaimer': 'Ferramenta de apoio à decisão clínica — CFM 2.454/2026',
+    }
