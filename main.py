@@ -111,6 +111,16 @@ class ECGRequest(BaseModel):
     paciente_id: Optional[str] = None
 
 
+class ECGSignalsRequest(BaseModel):
+    leads_100hz: list[list[float]]       # 12 derivações × 1000 amostras (100 Hz, 10s)
+    fc: Optional[float] = 0.0
+    pr_ms: Optional[float] = 0.0
+    qrs_ms: Optional[float] = 0.0
+    qtc_ms: Optional[float] = 0.0
+    rr_variability: Optional[float] = 0.0
+    paciente_id: Optional[str] = None
+
+
 class SepseRequest(BaseModel):
     hr: Optional[float] = None
     o2sat: Optional[float] = None
@@ -216,6 +226,41 @@ async def ecg(req: ECGRequest):
         "resultado": resultado,
         "confianca": round(top_conf, 4),
         "modelo": "rule-based-ecg-v1",
+        "aviso": DISCLAIMER_CFM,
+        "timestamp": _ts(),
+    }
+
+
+@app.post("/ecg/analyze-signals")
+async def analyze_ecg_signals(req: ECGSignalsRequest):
+    """
+    Análise ECG com LightGBM PTB-XL a partir dos sinais brutos das 12 derivações.
+    Requer: 12 derivações × 1000 amostras (100 Hz, 10 segundos).
+    Fallback automático para rule-based se modelo não disponível.
+    CFM 2.454/2026 — apoio à decisão clínica, não diagnóstico autônomo.
+    """
+    modelo = MODEL_REGISTRY.get("ecg")
+    if modelo is None:
+        raise HTTPException(503, "Modelo ECG não carregado.")
+
+    try:
+        result = modelo.predict_from_signals(
+            leads_100hz=req.leads_100hz,
+            fc=req.fc or 0.0,
+            pr_ms=req.pr_ms or 0.0,
+            qrs_ms=req.qrs_ms or 0.0,
+            qtc_ms=req.qtc_ms or 0.0,
+            rr_variability=req.rr_variability or 0.0,
+        )
+    except Exception as e:
+        logger.exception("Erro /ecg/analyze-signals")
+        raise HTTPException(500, f"Erro na análise ECG-LightGBM: {e}")
+
+    top_conf = result.get("top_probabilidade", 0.0)
+    return {
+        "resultado": result,
+        "confianca": round(float(top_conf), 4),
+        "modelo": result.get("modelo", "lgbm_ptbxl"),
         "aviso": DISCLAIMER_CFM,
         "timestamp": _ts(),
     }

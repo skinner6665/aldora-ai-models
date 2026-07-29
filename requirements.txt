@@ -18,3 +18,7 @@ xgboost>=2.0.0
 scikit-learn>=1.4.0
 pandas>=2.2.0
 shap>=0.46.0
+
+# ECG — LightGBM PTB-XL + feature extraction
+lightgbm>=4.0.0
+scipy>=1.10.0
