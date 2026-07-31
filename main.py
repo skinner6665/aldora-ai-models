@@ -1,14 +1,18 @@
 """
-Aldora AI Models Microservice v2
-FastAPI — CheXpert, ECG (rule-based), HAM10000/EfficientNet-B4, XGBoost Sepse, Pill Identifier
-Todos os endpoints retornam: {resultado, confianca, modelo, aviso, timestamp}
+Aldora AI Models Microservice v3
+FastAPI — 5 modelos legados + 11 tabular GBM/XGBoost + 7 ONNX imagem
+CFM 2.454/2026 — apoio diagnóstico, não substituição clínica.
 """
-import os, io, base64, logging
+import io
+import os
+import base64
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
+import numpy as np
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -23,33 +27,128 @@ DISCLAIMER_CFM = (
     "Não comunicar ao paciente sem mediação do médico responsável."
 )
 
+DISCLAIMER_SHORT = (
+    "Ferramenta de apoio à decisão clínica. Decisão final é do médico. CFM 2.454/2026."
+)
+
+# Labels para modelos ONNX (ordem dos neurônios de saída)
+_ONNX_LABELS: dict[str, list[str]] = {
+    "chest_xray":  ["normal", "anormal"],
+    "skin":        ["nv", "mel", "bkl", "bcc", "akiec", "vasc", "df"],
+    "retinopathy": ["grau_0", "grau_1", "grau_2", "grau_3", "grau_4"],
+    "brain_tumor": ["glioma", "meningioma", "pituitary", "no_tumor"],
+    "fracture":    ["normal", "fratura"],
+    "glaucoma":    ["normal", "glaucoma"],
+    "mammography": ["normal", "anormal"],
+}
+
 
 def _ts() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def load_models():
-    """Carrega todos os modelos ao iniciar. Falhas individuais não impedem o startup."""
+# ── Helpers de inferência ─────────────────────────────────────────────────────
+
+def _softmax(x: np.ndarray) -> np.ndarray:
+    e = np.exp(x - x.max())
+    return e / e.sum()
+
+
+def _preprocess_onnx(image_bytes: bytes) -> np.ndarray:
+    from PIL import Image
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB").resize((224, 224))
+    arr = np.array(img, dtype=np.float32) / 255.0
+    arr = (arr - np.array([0.485, 0.456, 0.406], dtype=np.float32)) \
+        / np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    return arr.transpose(2, 0, 1)[np.newaxis].astype(np.float32)  # (1,3,224,224)
+
+
+def _onnx_infer(session, image_bytes: bytes, labels: list[str], model_file: str) -> dict:
+    inp = _preprocess_onnx(image_bytes)
+    out = session.run(None, {session.get_inputs()[0].name: inp})[0][0]
+    if abs(float(out.sum()) - 1.0) > 0.05:
+        out = _softmax(out)
+    pred_idx = int(out.argmax())
+    return {
+        "predicao":      labels[pred_idx],
+        "confianca":     round(float(out[pred_idx]), 4),
+        "scores":        {labels[i]: round(float(out[i]), 4) for i in range(len(labels))},
+        "modelo_versao": model_file,
+        "disclaimer":    DISCLAIMER_SHORT,
+    }
+
+
+def _tabular_infer(model, values: list, features: list[str], model_file: str) -> dict:
+    import pandas as pd
+    X = pd.DataFrame([dict(zip(features, values))])
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(X)[0]
+        classes = [str(c) for c in (model.classes_ if hasattr(model, "classes_") else range(len(proba)))]
+        idx = int(proba.argmax())
+        return {
+            "predicao":      classes[idx],
+            "confianca":     round(float(proba[idx]), 4),
+            "scores":        {c: round(float(p), 4) for c, p in zip(classes, proba)},
+            "modelo_versao": model_file,
+            "disclaimer":    DISCLAIMER_SHORT,
+        }
+    pred = float(model.predict(X)[0])
+    label = "1" if pred >= 0.5 else "0"
+    return {
+        "predicao":      label,
+        "confianca":     round(abs(pred - 0.5) + 0.5, 4),
+        "scores":        {"0": round(1.0 - pred, 4), "1": round(pred, 4)},
+        "modelo_versao": model_file,
+        "disclaimer":    DISCLAIMER_SHORT,
+    }
+
+
+# ── Carregamento de modelos ───────────────────────────────────────────────────
+
+def _load_pkl(key: str, path: str, label: str) -> None:
+    try:
+        import joblib
+        MODEL_REGISTRY[key] = joblib.load(path)
+        logger.info("%s carregado (%s).", label, path)
+    except Exception as e:
+        logger.warning("%s não disponível: %s", label, e)
+
+
+def _load_onnx(key: str, path: str, label: str) -> None:
+    try:
+        import onnxruntime as ort
+        MODEL_REGISTRY[key] = ort.InferenceSession(
+            path, providers=["CPUExecutionProvider"]
+        )
+        logger.info("%s carregado (%s).", label, path)
+    except Exception as e:
+        logger.warning("%s não disponível: %s", label, e)
+
+
+def load_models() -> None:
+    """Carrega todos os modelos ao iniciar. Falhas individuais não bloqueiam startup."""
+
+    # ── Modelos legados ───────────────────────────────────────────────────────
     try:
         from models.chexpert_model import load_chexpert
         MODEL_REGISTRY["chexpert"] = load_chexpert()
         logger.info("CheXpert (densenet121-res224-all) carregado.")
     except Exception as e:
-        logger.warning(f"CheXpert não disponível: {e}")
+        logger.warning("CheXpert não disponível: %s", e)
 
     try:
         from models.ecg_model import load_ecg
         MODEL_REGISTRY["ecg"] = load_ecg()
         logger.info("ECG (rule-based clínico) carregado.")
     except Exception as e:
-        logger.warning(f"ECG não disponível: {e}")
+        logger.warning("ECG não disponível: %s", e)
 
     try:
         from models.derma_model import load_derma
         MODEL_REGISTRY["derma"] = load_derma()
         logger.info("HAM10000/EfficientNet-B4 carregado.")
     except Exception as e:
-        logger.warning(f"Derma não disponível: {e}")
+        logger.warning("Derma não disponível: %s", e)
 
     try:
         from models.sepse_model import _load_model
@@ -57,14 +156,34 @@ def load_models():
         MODEL_REGISTRY["sepse"] = "xgboost-pkl-v1"
         logger.info("XGBoost Sepse (pkl, AUC 0.8766) carregado.")
     except Exception as e:
-        logger.warning(f"Sepse não disponível: {e}")
+        logger.warning("Sepse não disponível: %s", e)
 
     try:
         from models.pill_model import load_pill
         MODEL_REGISTRY["pill"] = load_pill()
         logger.info("Pill Identifier (Claude Vision) carregado.")
     except Exception as e:
-        logger.warning(f"Pill Identifier não disponível: {e}")
+        logger.warning("Pill Identifier não disponível: %s", e)
+
+    # ── Novos modelos tabular (pkl) ───────────────────────────────────────────
+    _load_pkl("cardiac",       "models/cardiac_xgboost_v2_combined.pkl", "Cardiac XGBoost v2")
+    _load_pkl("preeclampsia",  "models/preeclampsia_gbm.pkl",            "Preeclampsia GBM")
+    _load_pkl("mortality",     "models/mortality_gbm.pkl",               "Mortality GBM")
+    _load_pkl("readmissao",    "models/readmissao_gbm.pkl",              "Readmissão GBM")
+    _load_pkl("deterioracao",  "models/deterioracao_gbm.pkl",            "Deterioração GBM")
+    _load_pkl("vitaldb",       "models/vitaldb_ihi_v2.pkl",              "VitalDB IHI v2")
+    _load_pkl("eeg",           "models/eeg_epilepsy_combined_gbm.pkl",   "EEG Epilepsia GBM")
+    _load_pkl("circor",        "models/circor_cardiac_gbm.pkl",          "CirCor Cardiac GBM")
+    _load_pkl("lung_sound",    "models/lung_sound_ensemble.pkl",         "Lung Sound Ensemble")
+
+    # ── Novos modelos ONNX (imagem) ───────────────────────────────────────────
+    _load_onnx("onnx_chest",   "models/chest_xray.onnx",          "Chest X-Ray ONNX")
+    _load_onnx("onnx_skin",    "models/skin_dermatologia.onnx",    "Skin Dermatologia ONNX")
+    _load_onnx("onnx_retina",  "models/retinopatia.onnx",          "Retinopatia ONNX")
+    _load_onnx("onnx_brain",   "models/hemorragia_cerebral.onnx",  "Hemorragia Cerebral ONNX")
+    _load_onnx("onnx_fracture","models/fratura_ossea.onnx",        "Fratura Óssea ONNX")
+    _load_onnx("onnx_glaucoma","models/glaucoma.onnx",             "Glaucoma ONNX")
+    _load_onnx("onnx_mammo",   "models/mamografia.onnx",           "Mamografia ONNX")
 
 
 @asynccontextmanager
@@ -75,10 +194,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Aldora AI Models",
-    version="2.0.0",
+    version="3.0.0",
     description=(
-        "Microserviço de IA médica: CheXpert (14 patologias), "
-        "ECG rule-based, HAM10000 (7 classes), XGBoost Sepse, Pill Identifier. "
+        "Microserviço de IA médica: 5 modelos legados + 11 tabular GBM/XGBoost + 7 ONNX imagem. "
         "CFM 2.454/2026 — apoio diagnóstico, não substituição clínica."
     ),
     lifespan=lifespan,
@@ -103,16 +221,16 @@ class ImageRequest(BaseModel):
 
 
 class ECGRequest(BaseModel):
-    fc: float               # Frequência cardíaca (bpm)
-    pr_ms: float            # Intervalo PR (ms)
-    qrs_ms: float           # Duração QRS (ms)
-    qtc_ms: float           # QTc corrigido por Bazett (ms)
-    rr_variability: float = 0.0  # Variabilidade RR (ms); 0 se indisponível
+    fc: float
+    pr_ms: float
+    qrs_ms: float
+    qtc_ms: float
+    rr_variability: float = 0.0
     paciente_id: Optional[str] = None
 
 
 class ECGSignalsRequest(BaseModel):
-    leads_100hz: list[list[float]]       # 12 derivações × 1000 amostras (100 Hz, 10s)
+    leads_100hz: list[list[float]]
     fc: Optional[float] = 0.0
     pr_ms: Optional[float] = 0.0
     qrs_ms: Optional[float] = 0.0
@@ -156,13 +274,109 @@ class SepseRequest(BaseModel):
     fibrinogen: Optional[float] = None
     platelets: Optional[float] = None
     age: Optional[float] = None
-    gender: Optional[float] = None      # 0=F, 1=M
-    unit1: Optional[float] = None       # MICU=1
-    unit2: Optional[float] = None       # SICU=1
+    gender: Optional[float] = None
+    unit1: Optional[float] = None
+    unit2: Optional[float] = None
     hosp_adm_elapsed: Optional[float] = None
     icu_los_days: Optional[float] = None
     hora_no_icu: Optional[float] = None
     paciente_id: Optional[str] = None
+
+
+# Novos schemas tabular
+class CardiacRequest(BaseModel):
+    murmur_presence: Optional[float] = 0.0   # 0=Absent, 1=Present
+    age_years: Optional[float] = 30.0
+    sex: Optional[float] = 0.0               # 0=F, 1=M
+    pregnancy_status: Optional[float] = 0.0
+    campaign: Optional[float] = 1.0
+
+
+class PreeclampsiaRequest(BaseModel):
+    age: Optional[float] = 25.0
+    bmi: Optional[float] = 22.0
+    systolic_bp: Optional[float] = 120.0
+    diastolic_bp: Optional[float] = 80.0
+    mean_arterial_pressure: Optional[float] = 93.0
+    proteinuria: Optional[float] = 0.0
+    creatinine: Optional[float] = 0.8
+    platelets: Optional[float] = 250.0
+    alt: Optional[float] = 20.0
+    ast: Optional[float] = 20.0
+    gestational_age: Optional[float] = 28.0
+
+
+class MortalityRequest(BaseModel):
+    age: Optional[float] = 50.0
+    sofa_score: Optional[float] = 0.0
+    apache_ii: Optional[float] = 0.0
+    gcs: Optional[float] = 15.0
+    lactate: Optional[float] = 1.0
+    creatinine: Optional[float] = 0.8
+    bilirubin: Optional[float] = 0.5
+    platelets: Optional[float] = 250.0
+    pao2_fio2: Optional[float] = 400.0
+    vasopressors: Optional[float] = 0.0
+
+
+class ReadmissaoRequest(BaseModel):
+    age: Optional[float] = 50.0
+    length_of_stay: Optional[float] = 5.0
+    charlson_index: Optional[float] = 0.0
+    lace_score: Optional[float] = 5.0
+    previous_admissions: Optional[float] = 0.0
+    diagnosis_icd: Optional[float] = 0.0   # codificado
+
+
+class DeterioracaoRequest(BaseModel):
+    news2_score: Optional[float] = 0.0
+    delta_fc: Optional[float] = 0.0
+    delta_fr: Optional[float] = 0.0
+    delta_pas: Optional[float] = 0.0
+    delta_temperatura: Optional[float] = 0.0
+    delta_saturacao: Optional[float] = 0.0
+    delta_glasgow: Optional[float] = 0.0
+
+
+class VitalDBRequest(BaseModel):
+    mbp: Optional[float] = 80.0
+    hr: Optional[float] = 70.0
+    spo2: Optional[float] = 98.0
+    etco2: Optional[float] = 35.0
+    bis: Optional[float] = 50.0
+    temperature: Optional[float] = 36.5
+    age: Optional[float] = 50.0
+    asa_class: Optional[float] = 2.0
+    operation_type: Optional[float] = 0.0
+
+
+class EEGRequest(BaseModel):
+    delta_power: Optional[float] = 0.0
+    theta_power: Optional[float] = 0.0
+    alpha_power: Optional[float] = 0.0
+    beta_power: Optional[float] = 0.0
+    gamma_power: Optional[float] = 0.0
+    spectral_entropy: Optional[float] = 0.0
+    hjorth_mobility: Optional[float] = 0.0
+    hjorth_complexity: Optional[float] = 0.0
+
+
+class CircorRequest(BaseModel):
+    age_months: Optional[float] = 120.0
+    weight: Optional[float] = 20.0
+    height: Optional[float] = 110.0
+    sex: Optional[float] = 0.0
+    murmur_locations: Optional[float] = 0.0
+    systolic_murmur_timing: Optional[float] = 0.0
+    diastolic_murmur_timing: Optional[float] = 0.0
+
+
+class LungSoundRequest(BaseModel):
+    mfcc_mean: Optional[float] = 0.0
+    mfcc_std: Optional[float] = 0.0
+    spectral_centroid: Optional[float] = 0.0
+    zero_crossing_rate: Optional[float] = 0.0
+    rms_energy: Optional[float] = 0.0
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -172,158 +386,101 @@ def health():
     return {
         "status": "ok",
         "modelos": {k: "carregado" for k in MODEL_REGISTRY},
-        "versao": "2.0.0",
+        "versao": "3.0.0",
         "timestamp": _ts(),
     }
 
+
+# ── Legados ───────────────────────────────────────────────────────────────────
 
 @app.post("/v1/chexpert")
 async def chexpert(req: ImageRequest):
-    """
-    CheXpert — torchxrayvision DenseNet121-res224-all.
-    14 patologias pulmonares. AUC médio ~0.84.
-    """
+    """CheXpert — DenseNet121-res224-all. 14 patologias pulmonares."""
     modelo = MODEL_REGISTRY.get("chexpert")
     if modelo is None:
-        raise HTTPException(503, "Modelo CheXpert não carregado. Verifique os logs de startup.")
-
+        raise HTTPException(503, "Modelo CheXpert não carregado.")
     try:
-        img_bytes = base64.b64decode(req.image_base64)
-        resultado = modelo.predict(img_bytes)
+        resultado = modelo.predict(base64.b64decode(req.image_base64))
     except Exception as e:
         logger.exception("Erro CheXpert")
         raise HTTPException(500, f"Erro na inferência: {e}")
-
     top_conf = resultado[0]["probabilidade"] if resultado else 0.0
-    return {
-        "resultado": resultado,
-        "confianca": round(top_conf, 4),
-        "modelo": "torchxrayvision/densenet121-res224-all",
-        "aviso": DISCLAIMER_CFM,
-        "timestamp": _ts(),
-    }
+    return {"resultado": resultado, "confianca": round(top_conf, 4),
+            "modelo": "torchxrayvision/densenet121-res224-all",
+            "aviso": DISCLAIMER_CFM, "timestamp": _ts()}
 
 
 @app.post("/v1/ecg")
 async def ecg(req: ECGRequest):
-    """
-    ECG — análise rule-based clínica (ACC/AHA/SBC).
-    Parâmetros: FC, intervalo PR, duração QRS, QTc (Bazett), variabilidade RR.
-    """
+    """ECG — análise rule-based clínica (ACC/AHA/SBC)."""
     modelo = MODEL_REGISTRY.get("ecg")
     if modelo is None:
         raise HTTPException(503, "Modelo ECG não carregado.")
-
     try:
         resultado = modelo.predict(req.fc, req.pr_ms, req.qrs_ms, req.qtc_ms, req.rr_variability)
     except Exception as e:
         logger.exception("Erro ECG")
         raise HTTPException(500, f"Erro na análise ECG: {e}")
-
     achados = resultado.get("achados", [])
     top_conf = achados[0]["probabilidade"] if achados else 0.0
-    return {
-        "resultado": resultado,
-        "confianca": round(top_conf, 4),
-        "modelo": "rule-based-ecg-v1",
-        "aviso": DISCLAIMER_CFM,
-        "timestamp": _ts(),
-    }
+    return {"resultado": resultado, "confianca": round(top_conf, 4),
+            "modelo": "rule-based-ecg-v1", "aviso": DISCLAIMER_CFM, "timestamp": _ts()}
 
 
 @app.post("/ecg/analyze-signals")
 async def analyze_ecg_signals(req: ECGSignalsRequest):
-    """
-    Análise ECG com LightGBM PTB-XL a partir dos sinais brutos das 12 derivações.
-    Requer: 12 derivações × 1000 amostras (100 Hz, 10 segundos).
-    Fallback automático para rule-based se modelo não disponível.
-    CFM 2.454/2026 — apoio à decisão clínica, não diagnóstico autônomo.
-    """
+    """ECG com LightGBM PTB-XL a partir dos sinais brutos (12 derivações × 1000 amostras)."""
     modelo = MODEL_REGISTRY.get("ecg")
     if modelo is None:
         raise HTTPException(503, "Modelo ECG não carregado.")
-
     try:
         result = modelo.predict_from_signals(
             leads_100hz=req.leads_100hz,
-            fc=req.fc or 0.0,
-            pr_ms=req.pr_ms or 0.0,
-            qrs_ms=req.qrs_ms or 0.0,
-            qtc_ms=req.qtc_ms or 0.0,
+            fc=req.fc or 0.0, pr_ms=req.pr_ms or 0.0,
+            qrs_ms=req.qrs_ms or 0.0, qtc_ms=req.qtc_ms or 0.0,
             rr_variability=req.rr_variability or 0.0,
         )
     except Exception as e:
         logger.exception("Erro /ecg/analyze-signals")
         raise HTTPException(500, f"Erro na análise ECG-LightGBM: {e}")
-
-    top_conf = result.get("top_probabilidade", 0.0)
-    return {
-        "resultado": result,
-        "confianca": round(float(top_conf), 4),
-        "modelo": result.get("modelo", "lgbm_ptbxl"),
-        "aviso": DISCLAIMER_CFM,
-        "timestamp": _ts(),
-    }
+    return {"resultado": result, "confianca": round(float(result.get("top_probabilidade", 0.0)), 4),
+            "modelo": result.get("modelo", "lgbm_ptbxl"),
+            "aviso": DISCLAIMER_CFM, "timestamp": _ts()}
 
 
 @app.post("/v1/derma")
 async def derma(req: ImageRequest):
-    """
-    HAM10000 — EfficientNet-B4 (timm).
-    7 classes de lesões cutâneas. Acurácia ~90% no HAM10000 test set.
-    """
+    """HAM10000 — EfficientNet-B4. 7 classes de lesões cutâneas."""
     modelo = MODEL_REGISTRY.get("derma")
     if modelo is None:
         raise HTTPException(503, "Modelo Dermatologia não carregado.")
-
     try:
-        img_bytes = base64.b64decode(req.image_base64)
-        resultado = modelo.predict(img_bytes)
+        resultado = modelo.predict(base64.b64decode(req.image_base64))
     except Exception as e:
         logger.exception("Erro Derma")
         raise HTTPException(500, f"Erro na inferência: {e}")
-
     top_conf = resultado[0]["probabilidade"] if resultado else 0.0
-    return {
-        "resultado": resultado,
-        "confianca": round(top_conf, 4),
-        "modelo": "efficientnet_b4-ham10000",
-        "aviso": DISCLAIMER_CFM,
-        "timestamp": _ts(),
-    }
+    return {"resultado": resultado, "confianca": round(top_conf, 4),
+            "modelo": "efficientnet_b4-ham10000", "aviso": DISCLAIMER_CFM, "timestamp": _ts()}
 
 
 @app.post("/v1/sepse")
 async def sepse(req: SepseRequest):
-    """
-    XGBoost Sepse — PhysioNet 2019 + MIMIC-IV + eICU.
-    19 variáveis clínicas. AUC-ROC: 0.8766.
-    """
+    """XGBoost Sepse — PhysioNet 2019 + MIMIC-IV. AUC-ROC 0.8766."""
     from models.sepse_model import predict_sepsis
     try:
-        dados = _mapear_sepse_request(req)
-        resultado = predict_sepsis(dados)
+        resultado = predict_sepsis(_mapear_sepse_request(req))
     except Exception as e:
         logger.exception("Erro Sepse")
         raise HTTPException(500, f"Erro na inferência: {e}")
-
-    return {
-        "resultado": resultado,
-        "confianca": resultado["probabilidade"],
-        "modelo": "xgboost-sepse-physionet2019-pkl",
-        "aviso": DISCLAIMER_CFM,
-        "timestamp": _ts(),
-    }
+    return {"resultado": resultado, "confianca": resultado["probabilidade"],
+            "modelo": "xgboost-sepse-physionet2019-pkl",
+            "aviso": DISCLAIMER_CFM, "timestamp": _ts()}
 
 
 @app.post("/sepsis/predict")
 async def predict_sepsis_endpoint(request: Request):
-    """
-    XGBoost Sepse — endpoint direto com JSON livre.
-    Aceita qualquer subconjunto das 19 features (HR, O2Sat, Temp, SBP, MAP,
-    DBP, Resp, BUN, Glucose, Lactate, Potassium, Creatinine, Hct, Hgb,
-    WBC, Platelets, Age, Gender, ICULOS). Valores ausentes imputados por mediana.
-    """
+    """XGBoost Sepse — endpoint direto com JSON livre. Aceita subconjunto das features."""
     try:
         dados = await request.json()
         from models.sepse_model import predict_sepsis
@@ -336,37 +493,323 @@ async def predict_sepsis_endpoint(request: Request):
 
 @app.post("/v1/pill")
 async def pill(req: ImageRequest):
-    """
-    Pill Identifier — Claude claude-sonnet-4-6 Vision.
-    Identifica comprimidos, cápsulas e medicamentos por imagem.
-    Requer ANTHROPIC_API_KEY configurada no ambiente.
-    """
+    """Pill Identifier — Claude Sonnet Vision."""
     modelo = MODEL_REGISTRY.get("pill")
     if modelo is None:
         raise HTTPException(503, "Pill Identifier não carregado. Verifique ANTHROPIC_API_KEY.")
-
     try:
-        img_bytes = base64.b64decode(req.image_base64)
-        resultado = modelo.predict(img_bytes, req.image_mime)
+        resultado = modelo.predict(base64.b64decode(req.image_base64), req.image_mime)
     except Exception as e:
         logger.exception("Erro Pill Identifier")
         raise HTTPException(500, f"Erro na identificação: {e}")
-
-    confianca_num = {"alta": 0.90, "media": 0.65, "baixa": 0.35}
     nivel = resultado.get("confianca", "baixa")
-    return {
-        "resultado": resultado,
-        "confianca": confianca_num.get(nivel, 0.35),
-        "modelo": "claude-sonnet-4-6-vision",
-        "aviso": DISCLAIMER_CFM,
-        "timestamp": _ts(),
-    }
+    return {"resultado": resultado,
+            "confianca": {"alta": 0.90, "media": 0.65, "baixa": 0.35}.get(nivel, 0.35),
+            "modelo": "claude-sonnet-4-6-vision", "aviso": DISCLAIMER_CFM, "timestamp": _ts()}
+
+
+# ── Novos endpoints tabular ───────────────────────────────────────────────────
+
+@app.post("/cardiac/predict")
+async def cardiac_predict(req: CardiacRequest):
+    """
+    Cardiac XGBoost v2 — CirCor 2022 + PCG combined.
+    Features: murmur_presence, age_years, sex, pregnancy_status, campaign.
+    """
+    model = MODEL_REGISTRY.get("cardiac")
+    if model is None:
+        raise HTTPException(503, "Modelo cardiac_xgboost_v2_combined.pkl não carregado. Execute download_models.py.")
+    try:
+        features = ["murmur_presence", "age_years", "sex", "pregnancy_status", "campaign"]
+        values = [req.murmur_presence, req.age_years, req.sex, req.pregnancy_status, req.campaign]
+        return _tabular_infer(model, values, features, "cardiac_xgboost_v2_combined.pkl")
+    except Exception as e:
+        logger.exception("Erro /cardiac/predict")
+        raise HTTPException(500, f"Erro na inferência: {e}")
+
+
+@app.post("/preeclampsia/predict")
+async def preeclampsia_predict(req: PreeclampsiaRequest):
+    """
+    Preeclampsia GBM — predição de pré-eclâmpsia.
+    Features: age, bmi, systolic_bp, diastolic_bp, MAP, proteinuria,
+    creatinine, platelets, alt, ast, gestational_age.
+    """
+    model = MODEL_REGISTRY.get("preeclampsia")
+    if model is None:
+        raise HTTPException(503, "Modelo preeclampsia_gbm.pkl não carregado. Execute download_models.py.")
+    try:
+        features = ["age", "bmi", "systolic_bp", "diastolic_bp", "mean_arterial_pressure",
+                    "proteinuria", "creatinine", "platelets", "alt", "ast", "gestational_age"]
+        values = [req.age, req.bmi, req.systolic_bp, req.diastolic_bp, req.mean_arterial_pressure,
+                  req.proteinuria, req.creatinine, req.platelets, req.alt, req.ast, req.gestational_age]
+        return _tabular_infer(model, values, features, "preeclampsia_gbm.pkl")
+    except Exception as e:
+        logger.exception("Erro /preeclampsia/predict")
+        raise HTTPException(500, f"Erro na inferência: {e}")
+
+
+@app.post("/mortality/predict")
+async def mortality_predict(req: MortalityRequest):
+    """
+    Mortality GBM — predição de mortalidade hospitalar (MIMIC-IV).
+    Features: age, sofa_score, apache_ii, gcs, lactate, creatinine,
+    bilirubin, platelets, pao2_fio2, vasopressors.
+    """
+    model = MODEL_REGISTRY.get("mortality")
+    if model is None:
+        raise HTTPException(503, "Modelo mortality_gbm.pkl não carregado. Execute download_models.py.")
+    try:
+        features = ["age", "sofa_score", "apache_ii", "gcs", "lactate",
+                    "creatinine", "bilirubin", "platelets", "pao2_fio2", "vasopressors"]
+        values = [req.age, req.sofa_score, req.apache_ii, req.gcs, req.lactate,
+                  req.creatinine, req.bilirubin, req.platelets, req.pao2_fio2, req.vasopressors]
+        return _tabular_infer(model, values, features, "mortality_gbm.pkl")
+    except Exception as e:
+        logger.exception("Erro /mortality/predict")
+        raise HTTPException(500, f"Erro na inferência: {e}")
+
+
+@app.post("/readmissao/predict")
+async def readmissao_predict(req: ReadmissaoRequest):
+    """
+    Readmissão GBM — risco de readmissão em 30 dias.
+    Features: age, length_of_stay, charlson_index, lace_score,
+    previous_admissions, diagnosis_icd.
+    """
+    model = MODEL_REGISTRY.get("readmissao")
+    if model is None:
+        raise HTTPException(503, "Modelo readmissao_gbm.pkl não carregado. Execute download_models.py.")
+    try:
+        features = ["age", "length_of_stay", "charlson_index", "lace_score",
+                    "previous_admissions", "diagnosis_icd"]
+        values = [req.age, req.length_of_stay, req.charlson_index, req.lace_score,
+                  req.previous_admissions, req.diagnosis_icd]
+        return _tabular_infer(model, values, features, "readmissao_gbm.pkl")
+    except Exception as e:
+        logger.exception("Erro /readmissao/predict")
+        raise HTTPException(500, f"Erro na inferência: {e}")
+
+
+@app.post("/deterioracao/predict")
+async def deterioracao_predict(req: DeterioracaoRequest):
+    """
+    Deterioração GBM — predição de deterioração clínica precoce (NEWS2 delta).
+    Features: news2_score, delta_fc, delta_fr, delta_pas, delta_temperatura,
+    delta_saturacao, delta_glasgow.
+    """
+    model = MODEL_REGISTRY.get("deterioracao")
+    if model is None:
+        raise HTTPException(503, "Modelo deterioracao_gbm.pkl não carregado. Execute download_models.py.")
+    try:
+        features = ["news2_score", "delta_fc", "delta_fr", "delta_pas",
+                    "delta_temperatura", "delta_saturacao", "delta_glasgow"]
+        values = [req.news2_score, req.delta_fc, req.delta_fr, req.delta_pas,
+                  req.delta_temperatura, req.delta_saturacao, req.delta_glasgow]
+        return _tabular_infer(model, values, features, "deterioracao_gbm.pkl")
+    except Exception as e:
+        logger.exception("Erro /deterioracao/predict")
+        raise HTTPException(500, f"Erro na inferência: {e}")
+
+
+@app.post("/vitaldb/predict")
+async def vitaldb_predict(req: VitalDBRequest):
+    """
+    VitalDB IHI v2 — predição de eventos intraoperatórios (VitalDB 2024).
+    Features: mbp, hr, spo2, etco2, bis, temperature, age, asa_class, operation_type.
+    """
+    model = MODEL_REGISTRY.get("vitaldb")
+    if model is None:
+        raise HTTPException(503, "Modelo vitaldb_ihi_v2.pkl não carregado. Execute download_models.py.")
+    try:
+        features = ["mbp", "hr", "spo2", "etco2", "bis", "temperature",
+                    "age", "asa_class", "operation_type"]
+        values = [req.mbp, req.hr, req.spo2, req.etco2, req.bis, req.temperature,
+                  req.age, req.asa_class, req.operation_type]
+        return _tabular_infer(model, values, features, "vitaldb_ihi_v2.pkl")
+    except Exception as e:
+        logger.exception("Erro /vitaldb/predict")
+        raise HTTPException(500, f"Erro na inferência: {e}")
+
+
+@app.post("/eeg/predict")
+async def eeg_predict(req: EEGRequest):
+    """
+    EEG Epilepsia GBM — classificação de atividade epileptiforme por banda espectral.
+    Features: delta_power, theta_power, alpha_power, beta_power, gamma_power,
+    spectral_entropy, hjorth_mobility, hjorth_complexity.
+    """
+    model = MODEL_REGISTRY.get("eeg")
+    if model is None:
+        raise HTTPException(503, "Modelo eeg_epilepsy_combined_gbm.pkl não carregado. Execute download_models.py.")
+    try:
+        features = ["delta_power", "theta_power", "alpha_power", "beta_power", "gamma_power",
+                    "spectral_entropy", "hjorth_mobility", "hjorth_complexity"]
+        values = [req.delta_power, req.theta_power, req.alpha_power, req.beta_power, req.gamma_power,
+                  req.spectral_entropy, req.hjorth_mobility, req.hjorth_complexity]
+        return _tabular_infer(model, values, features, "eeg_epilepsy_combined_gbm.pkl")
+    except Exception as e:
+        logger.exception("Erro /eeg/predict")
+        raise HTTPException(500, f"Erro na inferência: {e}")
+
+
+@app.post("/circor/predict")
+async def circor_predict(req: CircorRequest):
+    """
+    CirCor Cardiac GBM — detecção de sopro cardíaco pediátrico (CirCor 2022).
+    Features: age_months, weight, height, sex, murmur_locations,
+    systolic_murmur_timing, diastolic_murmur_timing.
+    """
+    model = MODEL_REGISTRY.get("circor")
+    if model is None:
+        raise HTTPException(503, "Modelo circor_cardiac_gbm.pkl não carregado. Execute download_models.py.")
+    try:
+        features = ["age_months", "weight", "height", "sex", "murmur_locations",
+                    "systolic_murmur_timing", "diastolic_murmur_timing"]
+        values = [req.age_months, req.weight, req.height, req.sex, req.murmur_locations,
+                  req.systolic_murmur_timing, req.diastolic_murmur_timing]
+        return _tabular_infer(model, values, features, "circor_cardiac_gbm.pkl")
+    except Exception as e:
+        logger.exception("Erro /circor/predict")
+        raise HTTPException(500, f"Erro na inferência: {e}")
+
+
+@app.post("/lung/predict")
+async def lung_predict(req: LungSoundRequest):
+    """
+    Lung Sound Ensemble — classificação de sons respiratórios (ICBHI 2017).
+    Features: mfcc_mean, mfcc_std, spectral_centroid, zero_crossing_rate, rms_energy.
+    """
+    model = MODEL_REGISTRY.get("lung_sound")
+    if model is None:
+        raise HTTPException(503, "Modelo lung_sound_ensemble.pkl não carregado. Execute download_models.py.")
+    try:
+        features = ["mfcc_mean", "mfcc_std", "spectral_centroid", "zero_crossing_rate", "rms_energy"]
+        values = [req.mfcc_mean, req.mfcc_std, req.spectral_centroid, req.zero_crossing_rate, req.rms_energy]
+        return _tabular_infer(model, values, features, "lung_sound_ensemble.pkl")
+    except Exception as e:
+        logger.exception("Erro /lung/predict")
+        raise HTTPException(500, f"Erro na inferência: {e}")
+
+
+# ── Novos endpoints ONNX (imagem) ─────────────────────────────────────────────
+
+@app.post("/image/chest-xray")
+async def image_chest_xray(image: UploadFile = File(...)):
+    """
+    Chest X-Ray ONNX — EfficientNet-B0. Classificação: normal / anormal.
+    Entrada: multipart/form-data campo 'image' (JPEG/PNG).
+    """
+    session = MODEL_REGISTRY.get("onnx_chest")
+    if session is None:
+        raise HTTPException(503, "Modelo chest_xray.onnx não carregado. Execute download_models.py.")
+    try:
+        return _onnx_infer(session, await image.read(), _ONNX_LABELS["chest_xray"], "chest_xray.onnx")
+    except Exception as e:
+        logger.exception("Erro /image/chest-xray")
+        raise HTTPException(500, f"Erro na inferência: {e}")
+
+
+@app.post("/image/skin")
+async def image_skin(image: UploadFile = File(...)):
+    """
+    Skin Dermatologia ONNX — EfficientNet-B0. 7 classes: nv, mel, bkl, bcc, akiec, vasc, df.
+    Entrada: multipart/form-data campo 'image' (JPEG/PNG).
+    """
+    session = MODEL_REGISTRY.get("onnx_skin")
+    if session is None:
+        raise HTTPException(503, "Modelo skin_dermatologia.onnx não carregado. Execute download_models.py.")
+    try:
+        return _onnx_infer(session, await image.read(), _ONNX_LABELS["skin"], "skin_dermatologia.onnx")
+    except Exception as e:
+        logger.exception("Erro /image/skin")
+        raise HTTPException(500, f"Erro na inferência: {e}")
+
+
+@app.post("/image/retinopathy")
+async def image_retinopathy(image: UploadFile = File(...)):
+    """
+    Retinopatia ONNX — EfficientNet-B0. Graduação: grau_0 (sem) a grau_4 (proliferativo).
+    Entrada: multipart/form-data campo 'image' (JPEG/PNG).
+    """
+    session = MODEL_REGISTRY.get("onnx_retina")
+    if session is None:
+        raise HTTPException(503, "Modelo retinopatia.onnx não carregado. Execute download_models.py.")
+    try:
+        return _onnx_infer(session, await image.read(), _ONNX_LABELS["retinopathy"], "retinopatia.onnx")
+    except Exception as e:
+        logger.exception("Erro /image/retinopathy")
+        raise HTTPException(500, f"Erro na inferência: {e}")
+
+
+@app.post("/image/brain-tumor")
+async def image_brain_tumor(image: UploadFile = File(...)):
+    """
+    Hemorragia Cerebral ONNX — EfficientNet-B0. Classes: glioma, meningioma, pituitary, no_tumor.
+    Entrada: multipart/form-data campo 'image' (JPEG/PNG).
+    """
+    session = MODEL_REGISTRY.get("onnx_brain")
+    if session is None:
+        raise HTTPException(503, "Modelo hemorragia_cerebral.onnx não carregado. Execute download_models.py.")
+    try:
+        return _onnx_infer(session, await image.read(), _ONNX_LABELS["brain_tumor"], "hemorragia_cerebral.onnx")
+    except Exception as e:
+        logger.exception("Erro /image/brain-tumor")
+        raise HTTPException(500, f"Erro na inferência: {e}")
+
+
+@app.post("/image/fracture")
+async def image_fracture(image: UploadFile = File(...)):
+    """
+    Fratura Óssea ONNX — EfficientNet-B0. Classificação: normal / fratura.
+    Entrada: multipart/form-data campo 'image' (JPEG/PNG).
+    """
+    session = MODEL_REGISTRY.get("onnx_fracture")
+    if session is None:
+        raise HTTPException(503, "Modelo fratura_ossea.onnx não carregado. Execute download_models.py.")
+    try:
+        return _onnx_infer(session, await image.read(), _ONNX_LABELS["fracture"], "fratura_ossea.onnx")
+    except Exception as e:
+        logger.exception("Erro /image/fracture")
+        raise HTTPException(500, f"Erro na inferência: {e}")
+
+
+@app.post("/image/glaucoma")
+async def image_glaucoma(image: UploadFile = File(...)):
+    """
+    Glaucoma ONNX — EfficientNet-B0. Classificação: normal / glaucoma.
+    Entrada: multipart/form-data campo 'image' (JPEG/PNG).
+    """
+    session = MODEL_REGISTRY.get("onnx_glaucoma")
+    if session is None:
+        raise HTTPException(503, "Modelo glaucoma.onnx não carregado. Execute download_models.py.")
+    try:
+        return _onnx_infer(session, await image.read(), _ONNX_LABELS["glaucoma"], "glaucoma.onnx")
+    except Exception as e:
+        logger.exception("Erro /image/glaucoma")
+        raise HTTPException(500, f"Erro na inferência: {e}")
+
+
+@app.post("/image/mammography")
+async def image_mammography(image: UploadFile = File(...)):
+    """
+    Mamografia ONNX — EfficientNet-B0. Classificação: normal / anormal.
+    Entrada: multipart/form-data campo 'image' (JPEG/PNG).
+    """
+    session = MODEL_REGISTRY.get("onnx_mammo")
+    if session is None:
+        raise HTTPException(503, "Modelo mamografia.onnx não carregado. Execute download_models.py.")
+    try:
+        return _onnx_infer(session, await image.read(), _ONNX_LABELS["mammography"], "mamografia.onnx")
+    except Exception as e:
+        logger.exception("Erro /image/mammography")
+        raise HTTPException(500, f"Erro na inferência: {e}")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _mapear_sepse_request(req: SepseRequest) -> dict:
-    """Mapeia SepseRequest (campos lowercase) → dict com feature names do modelo XGBoost."""
+    """Mapeia SepseRequest → dict com feature names do modelo XGBoost."""
     return {
         'HR': req.hr, 'O2Sat': req.o2sat, 'Temp': req.temp,
         'SBP': req.sbp, 'MAP': req.map, 'DBP': req.dbp, 'Resp': req.resp,

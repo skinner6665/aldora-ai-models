@@ -25,9 +25,12 @@ print('EfficientNet-B4 OK')"
 # Copia código da aplicação
 COPY . .
 
-RUN mkdir -p checkpoints
+RUN mkdir -p checkpoints models
+
+# Download dos modelos GBM/XGBoost/ONNX do Google Drive
+# Falhas individuais não bloqueiam o build — endpoints retornam 503
+RUN python download_models.py || echo "Aviso: alguns modelos não foram baixados. Endpoints afetados retornarão HTTP 503."
 
 EXPOSE 8000
 
-# Porta padrão; Railway sobrescreve via startCommand com $PORT
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
