@@ -28,9 +28,8 @@ COPY . .
 
 RUN mkdir -p checkpoints models
 
-# Download dos modelos GBM/XGBoost/ONNX do Google Drive
-# Falhas individuais não bloqueiam o build — endpoints retornam 503
-RUN python download_models.py || echo "Aviso: alguns modelos não foram baixados. Endpoints afetados retornarão HTTP 503."
+# Modelos baixados no startup via lifespan (não no build)
+# Isso garante que novos modelos sejam carregados sem rebuild de imagem
 
 EXPOSE 8000
 

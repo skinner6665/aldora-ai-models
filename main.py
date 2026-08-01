@@ -195,6 +195,12 @@ def load_models() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("Iniciando download dos modelos...")
+    try:
+        import download_models  # executa o script de download
+        logger.info("Download dos modelos concluído.")
+    except Exception as e:
+        logger.warning("Falha no download de modelos: %s", e)
     load_models()
     yield
 
