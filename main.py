@@ -126,6 +126,19 @@ def _load_pkl(key: str, path: str, label: str) -> None:
         logger.warning("%s não disponível: %s", label, e)
 
 
+def _load_onnx_gbm(key: str, path: str, label: str) -> None:
+    """Carrega modelo GBM exportado como ONNX via onnxruntime."""
+    try:
+        from onnxruntime import InferenceSession
+        if not os.path.exists(path) or os.path.getsize(path) < 1000:
+            raise FileNotFoundError(f"arquivo ausente ou vazio: {path}")
+        sess = InferenceSession(path)
+        MODEL_REGISTRY[key] = sess
+        logger.info("%s carregado (%s).", label, path)
+    except Exception as e:
+        logger.warning("%s não disponível: %s", label, e)
+
+
 def _load_onnx(key: str, path: str, label: str) -> None:
     try:
         import onnxruntime as ort
@@ -177,16 +190,16 @@ def load_models() -> None:
     except Exception as e:
         logger.warning("Pill Identifier não disponível: %s", e)
 
-    # ── Novos modelos tabular (pkl) ───────────────────────────────────────────
-    _load_pkl("cardiac",       "models/cardiac_xgboost_v2_combined.pkl", "Cardiac XGBoost v2")
-    _load_pkl("preeclampsia",  "models/preeclampsia_gbm.pkl",            "Preeclampsia GBM")
-    _load_pkl("mortality",     "models/mortality_gbm.pkl",               "Mortality GBM")
-    _load_pkl("readmissao",    "models/readmissao_gbm.pkl",              "Readmissão GBM")
-    _load_pkl("deterioracao",  "models/deterioracao_gbm.pkl",            "Deterioração GBM")
-    _load_pkl("vitaldb",       "models/vitaldb_ihi_v2.pkl",              "VitalDB IHI v2")
-    _load_pkl("eeg",           "models/eeg_epilepsy_combined_gbm.pkl",   "EEG Epilepsia GBM")
-    _load_pkl("circor",        "models/circor_cardiac_gbm.pkl",          "CirCor Cardiac GBM")
-    _load_pkl("lung_sound",    "models/lung_sound_ensemble.pkl",         "Lung Sound Ensemble")
+    # ── Novos modelos tabular (ONNX) ─────────────────────────────────────────
+    _load_pkl("cardiac",          "models/cardiac_xgboost_v2_combined.pkl",  "Cardiac XGBoost v2")
+    _load_onnx_gbm("preeclampsia",  "models/preeclampsia_gbm.onnx",          "Preeclampsia GBM")
+    _load_onnx_gbm("mortality",     "models/mortality_gbm.onnx",             "Mortality GBM")
+    _load_onnx_gbm("readmissao",    "models/readmissao_gbm.onnx",            "Readmissão GBM")
+    _load_onnx_gbm("deterioracao",  "models/deterioracao_gbm.onnx",          "Deterioração GBM")
+    _load_onnx_gbm("vitaldb",       "models/vitaldb_ihi_v2.onnx",            "VitalDB IHI v2")
+    _load_onnx_gbm("eeg",           "models/eeg_epilepsy_combined_gbm.onnx", "EEG Epilepsia GBM")
+    _load_onnx_gbm("circor",        "models/circor_cardiac_gbm.onnx",        "CirCor Cardiac GBM")
+    _load_onnx_gbm("lung_sound",    "models/lung_sound_ensemble.onnx",       "Lung Sound Ensemble")
 
     # ── Modelos tabular adicionais ───────────────────────────────────────
     _load_pkl("sepsis_v2",     "models/sepsis_xgboost.pkl",             "Sepse XGBoost v2 (AUC 0.8645)")
