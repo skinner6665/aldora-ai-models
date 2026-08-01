@@ -176,14 +176,21 @@ def load_models() -> None:
     _load_pkl("circor",        "models/circor_cardiac_gbm.pkl",          "CirCor Cardiac GBM")
     _load_pkl("lung_sound",    "models/lung_sound_ensemble.pkl",         "Lung Sound Ensemble")
 
-    # ── Novos modelos ONNX (imagem) ───────────────────────────────────────────
-    _load_onnx("onnx_chest",   "models/chest_xray.onnx",          "Chest X-Ray ONNX")
-    _load_onnx("onnx_skin",    "models/skin_dermatologia.onnx",    "Skin Dermatologia ONNX")
-    _load_onnx("onnx_retina",  "models/retinopatia.onnx",          "Retinopatia ONNX")
-    _load_onnx("onnx_brain",   "models/hemorragia_cerebral.onnx",  "Hemorragia Cerebral ONNX")
-    _load_onnx("onnx_fracture","models/fratura_ossea.onnx",        "Fratura Óssea ONNX")
-    _load_onnx("onnx_glaucoma","models/glaucoma.onnx",             "Glaucoma ONNX")
-    _load_onnx("onnx_mammo",   "models/mamografia.onnx",           "Mamografia ONNX")
+    # ── Modelos tabular adicionais ───────────────────────────────────────
+    _load_pkl("sepsis_v2",     "models/sepsis_xgboost.pkl",             "Sepse XGBoost v2 (AUC 0.8645)")
+    _load_pkl("ecg_lgbm",      "models/ecg_lgbm_ptbxl.pkl",            "ECG LightGBM PTB-XL")
+
+    # ── Modelos imagem PTH (EfficientNet-B0 / DenseNet-121) ────────────
+    # Objetivo: registrar que foram baixados pelo download_models.py.
+    # Inferencia real usa torch.load() diretamente no endpoint correspondente.
+    _load_pkl("skin_img",      "models/skin_efficientnet_b0_gpu.pth",   "Skin EfficientNet-B0")
+    _load_pkl("eyepacs",       "models/eyepacs_efficientnet_b0.pth",    "EyePACS EfficientNet-B0")
+    _load_pkl("chest_xray14",  "models/chest_xray_efficientnet_b0.pth", "Chest XR EfficientNet-B0")
+    _load_pkl("chestxray14",   "models/chestxray14_densenet121_v2.pth", "ChestX-ray14 DenseNet-121")
+    _load_pkl("brain_tumor",   "models/brain_tumor_efficientnet_b0.pth","Brain Tumor EfficientNet-B0")
+    _load_pkl("fractura",      "models/fractura_efficientnet_b0.pth",   "Fratura EfficientNet-B0")
+    _load_pkl("glaucoma_img",  "models/glaucoma_efficientnet_b0.pth",   "Glaucoma EfficientNet-B0")
+    _load_pkl("mamografia_img","models/mamografia_efficientnet_b0.pth", "Mamografia EfficientNet-B0")
 
 
 @asynccontextmanager
@@ -386,7 +393,8 @@ def health():
     return {
         "status": "ok",
         "modelos": {k: "carregado" for k in MODEL_REGISTRY},
-        "versao": "3.0.0",
+        "total": len(MODEL_REGISTRY),
+        "versao": "3.1.0",
         "timestamp": _ts(),
     }
 
