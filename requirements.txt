@@ -31,3 +31,4 @@ onnxruntime>=1.18.0
 gdown>=5.1.0
 
 # force-rebuild: 2026-08-01
+python-multipart>=0.0.9
