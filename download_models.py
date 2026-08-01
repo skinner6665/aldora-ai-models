@@ -56,7 +56,7 @@ for dest, file_id in MODELS:
     url = f"https://drive.google.com/uc?id={file_id}"
     print(f"[DOWN] {dest} ...")
     try:
-        gdown.download(url, dest, quiet=False, fuzzy=True)
+        gdown.download(url, dest, quiet=False)
         if os.path.exists(dest) and os.path.getsize(dest) > 100:
             print(f"[OK]   {dest} ({os.path.getsize(dest) // 1024} KB)")
         else:
