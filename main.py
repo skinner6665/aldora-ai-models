@@ -105,6 +105,18 @@ def _tabular_infer(model, values: list, features: list[str], model_file: str) ->
 
 # ── Carregamento de modelos ───────────────────────────────────────────────────
 
+def _load_pth(key: str, path: str, label: str) -> None:
+    """Carrega modelo PyTorch (.pth) via torch.load — apenas verifica se arquivo existe e é válido."""
+    try:
+        import torch
+        if not os.path.exists(path) or os.path.getsize(path) < 1000:
+            raise FileNotFoundError(f"arquivo ausente ou vazio: {path}")
+        # Registra o path — inferência real carrega no endpoint
+        MODEL_REGISTRY[key] = path
+        logger.info("%s carregado (%s).", label, path)
+    except Exception as e:
+        logger.warning("%s não disponível: %s", label, e)
+
 def _load_pkl(key: str, path: str, label: str) -> None:
     try:
         import joblib
@@ -183,14 +195,14 @@ def load_models() -> None:
     # ── Modelos imagem PTH (EfficientNet-B0 / DenseNet-121) ────────────
     # Objetivo: registrar que foram baixados pelo download_models.py.
     # Inferencia real usa torch.load() diretamente no endpoint correspondente.
-    _load_pkl("skin_img",      "models/skin_efficientnet_b0_gpu.pth",   "Skin EfficientNet-B0")
-    _load_pkl("eyepacs",       "models/eyepacs_efficientnet_b0.pth",    "EyePACS EfficientNet-B0")
-    _load_pkl("chest_xray14",  "models/chest_xray_efficientnet_b0.pth", "Chest XR EfficientNet-B0")
-    _load_pkl("chestxray14",   "models/chestxray14_densenet121_v2.pth", "ChestX-ray14 DenseNet-121")
-    _load_pkl("brain_tumor",   "models/brain_tumor_efficientnet_b0.pth","Brain Tumor EfficientNet-B0")
-    _load_pkl("fractura",      "models/fractura_efficientnet_b0.pth",   "Fratura EfficientNet-B0")
-    _load_pkl("glaucoma_img",  "models/glaucoma_efficientnet_b0.pth",   "Glaucoma EfficientNet-B0")
-    _load_pkl("mamografia_img","models/mamografia_efficientnet_b0.pth", "Mamografia EfficientNet-B0")
+    _load_pth("skin_img",      "models/skin_efficientnet_b0_gpu.pth",   "Skin EfficientNet-B0")
+    _load_pth("eyepacs",       "models/eyepacs_efficientnet_b0.pth",    "EyePACS EfficientNet-B0")
+    _load_pth("chest_xray14",  "models/chest_xray_efficientnet_b0.pth", "Chest XR EfficientNet-B0")
+    _load_pth("chestxray14",   "models/chestxray14_densenet121_v2.pth", "ChestX-ray14 DenseNet-121")
+    _load_pth("brain_tumor",   "models/brain_tumor_efficientnet_b0.pth","Brain Tumor EfficientNet-B0")
+    _load_pth("fractura",      "models/fractura_efficientnet_b0.pth",   "Fratura EfficientNet-B0")
+    _load_pth("glaucoma_img",  "models/glaucoma_efficientnet_b0.pth",   "Glaucoma EfficientNet-B0")
+    _load_pth("mamografia_img","models/mamografia_efficientnet_b0.pth", "Mamografia EfficientNet-B0")
 
 
 @asynccontextmanager
