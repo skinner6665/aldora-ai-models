@@ -439,6 +439,7 @@ class DeterioracaoRequest(BaseModel):
     delta_temperatura: Optional[float] = 0.0
     delta_saturacao: Optional[float] = 0.0
     delta_glasgow: Optional[float] = 0.0
+    suporte_o2: Optional[float] = 0.0  # oxigênio suplementar (componente NEWS2)
 
 
 class VitalDBRequest(BaseModel):
@@ -717,9 +718,9 @@ async def deterioracao_predict(req: DeterioracaoRequest):
         raise HTTPException(503, "Modelo deterioracao_gbm.pkl não carregado. Execute download_models.py.")
     try:
         features = ["news2_score", "delta_fc", "delta_fr", "delta_pas",
-                    "delta_temperatura", "delta_saturacao", "delta_glasgow"]
+                    "delta_temperatura", "delta_saturacao", "delta_glasgow", "suporte_o2"]
         values = [req.news2_score, req.delta_fc, req.delta_fr, req.delta_pas,
-                  req.delta_temperatura, req.delta_saturacao, req.delta_glasgow]
+                  req.delta_temperatura, req.delta_saturacao, req.delta_glasgow, req.suporte_o2]
         return _tabular_infer(model, values, features, "deterioracao_gbm.pkl")
     except Exception as e:
         logger.exception("Erro /deterioracao/predict")
