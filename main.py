@@ -68,10 +68,22 @@ def _onnx_infer(session, image_bytes: bytes, labels: list[str], model_file: str)
     inp = _preprocess_onnx(image_bytes)
 
     if isinstance(session, str):
-        # PTH path — inferência PyTorch com lazy-cache
+        # PTH path (state dict) — EfficientNet-B0 com lazy-cache
         import torch
         if session not in _PTH_MODEL_CACHE:
-            model = torch.load(session, map_location="cpu", weights_only=False)
+            checkpoint = torch.load(session, map_location="cpu", weights_only=False)
+            if isinstance(checkpoint, dict):
+                # State dict — reconstruir EfficientNet-B0 com num_classes correto
+                from torchvision.models import efficientnet_b0
+                model = efficientnet_b0(weights=None)
+                num_classes = len(labels)
+                in_features = model.classifier[1].in_features
+                model.classifier[1] = torch.nn.Linear(in_features, num_classes)
+                # Remove prefixo 'module.' (DataParallel) se presente
+                state = {k.replace("module.", ""): v for k, v in checkpoint.items()}
+                model.load_state_dict(state, strict=False)
+            else:
+                model = checkpoint
             model.eval()
             _PTH_MODEL_CACHE[session] = model
         pth_model = _PTH_MODEL_CACHE[session]
