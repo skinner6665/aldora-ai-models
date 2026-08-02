@@ -1,9 +1,8 @@
 """
-AHS — Modelo XGBoost Sepse
-Treinado com: PhysioNet Challenge 2019 + MIMIC-IV Sintético + eICU Demo
-AUC-ROC: 0.8766
-Features: 19 variáveis clínicas
-Versão: 1.0.0-aldora
+AHS — Modelo Híbrido Sepse: XGBoost + qSOFA/SIRS
+XGBoost: PhysioNet Challenge 2019 + MIMIC-IV Sintético + eICU Demo (AUC=0.8766)
+Critérios clínicos: qSOFA (Sepsis-3), SIRS, shock hemodinâmico, hiperlactatemia
+Versão: 1.1.0-aldora-blend
 """
 
 import pickle
@@ -29,7 +28,6 @@ FEATURES = [
     'Age', 'Gender', 'ICULOS'
 ]
 
-# Medianas de imputação (PhysioNet Challenge 2019)
 FEATURE_MEDIANS: dict[str, float] = {
     'HR': 83.0, 'O2Sat': 97.0, 'Temp': 36.9, 'SBP': 122.0,
     'MAP': 82.0, 'DBP': 63.0, 'Resp': 18.0, 'BUN': 18.0,
@@ -40,55 +38,129 @@ FEATURE_MEDIANS: dict[str, float] = {
 }
 
 
-def predict_sepsis(dados: dict) -> dict:
+def _clinical_score(dados: dict) -> tuple[float, dict]:
     """
-    Prediz risco de sepse usando XGBoost treinado.
+    Computa score clínico híbrido: qSOFA + SIRS + componentes de choque.
+    Retorna (probabilidade_clinica [0,1], detalhes).
 
-    Input: dict com valores clínicos (qualquer subconjunto das 19 features)
-    Output: dict com score, risco, features_utilizadas, versao_modelo
+    qSOFA (Sepsis-3): GCS<15, FR≥22, PAS≤100 → cada critério = 1/3
+    SIRS: Temp anormal, FC>90, FR>20, WBC anormal → cada critério = 1/4
+    Lactato: >2 mmol/L indica hipoperfusão → componente 0-1
+    MAP: <65 mmHg = critério de choque séptico → componente 0-1
+    SpO2: <94% = hipoxemia → componente 0-1
     """
+    qsofa = 0
+    gcs = dados.get('GCS')
+    resp = dados.get('Resp')
+    sbp = dados.get('SBP')
+    hr = dados.get('HR')
+    temp = dados.get('Temp')
+    wbc = dados.get('WBC')
+    lactate = dados.get('Lactate')
+    map_val = dados.get('MAP')
+    spo2 = dados.get('O2Sat')
+
+    if gcs is not None and float(gcs) < 15:
+        qsofa += 1
+    if resp is not None and float(resp) >= 22:
+        qsofa += 1
+    if sbp is not None and float(sbp) <= 100:
+        qsofa += 1
+
+    sirs = 0
+    if temp is not None:
+        t = float(temp)
+        if t > 38.3 or t < 36.0:
+            sirs += 1
+    if hr is not None and float(hr) > 90:
+        sirs += 1
+    if resp is not None and float(resp) > 20:
+        sirs += 1
+    if wbc is not None:
+        w = float(wbc)
+        if w > 12.0 or w < 4.0:
+            sirs += 1
+
+    # Hiperlactatemia (>2 mmol/L = critério de sepse; >4 = choque séptico)
+    lactato_comp = 0.0
+    if lactate is not None:
+        l = float(lactate)
+        if l > 2.0:
+            lactato_comp = min(1.0, (l - 2.0) / 4.0)
+
+    # Choque hemodinâmico via MAP (<65 = critério Sepsis-3)
+    map_comp = 0.0
+    if map_val is not None:
+        m = float(map_val)
+        if m < 65.0:
+            map_comp = min(1.0, (65.0 - m) / 30.0)
+
+    # Hipoxemia (SpO2 < 94%)
+    spo2_comp = 0.0
+    if spo2 is not None:
+        s = float(spo2)
+        if s < 94.0:
+            spo2_comp = min(1.0, (94.0 - s) / 10.0)
+
+    # Pesos: qSOFA 35%, SIRS 20%, Lactato 20%, MAP-choque 15%, SpO2 10%
+    clinical_prob = (
+        (qsofa / 3.0) * 0.35 +
+        (sirs / 4.0) * 0.20 +
+        lactato_comp * 0.20 +
+        map_comp * 0.15 +
+        spo2_comp * 0.10
+    )
+
+    detalhes = {
+        'qsofa': qsofa,
+        'sirs': sirs,
+        'lactato_critico': lactate is not None and float(lactate) > 2.0,
+        'map_choque': map_val is not None and float(map_val) < 65.0,
+        'hipoxemia': spo2 is not None and float(spo2) < 94.0,
+    }
+    return clinical_prob, detalhes
+
+
+def predict_sepsis(dados: dict) -> dict:
     model_data = _load_model()
     model = model_data['model']
 
-    # Cópia defensiva para não mutar o dict do caller
     dados = dict(dados)
 
     # Auto-computar MAP quando SBP e DBP disponíveis mas MAP ausente.
-    # MAP = (SBP + 2*DBP) / 3  — critério hemodinâmico de sepse (< 65 mmHg = choque séptico).
     if dados.get('MAP') is None and dados.get('SBP') is not None and dados.get('DBP') is not None:
         sbp = float(dados['SBP'])
         dbp = float(dados['DBP'])
         dados['MAP'] = round((sbp + 2 * dbp) / 3, 1)
 
-    # ICULOS default = 0 quando não fornecido.
-    # O modelo foi treinado em pacientes UTI (mediana=24h), mas na ausência de contexto
-    # assume-se que o paciente não está na UTI ou acabou de ser admitido.
-    # Feature de maior importância (gain=24.9) — essencial para discriminação correta.
+    # ICULOS default=0 quando não em contexto UTI (out-of-distribution mas menos distorcido que mediana=24).
     if dados.get('ICULOS') is None:
         dados['ICULOS'] = 0.0
 
-    # Correção: usar "is None" em vez de "or" para não substituir zeros legítimos
-    # (ex: Temp=0 ou valores normalmente baixos que seriam mascarados pelo "or").
     X = np.array([[
         float(dados[feat] if dados.get(feat) is not None else FEATURE_MEDIANS[feat])
         for feat in FEATURES
     ]])
 
-    prob = float(model.predict_proba(X)[0][1])
-    score = round(prob * 100, 1)
+    xgb_prob = float(model.predict_proba(X)[0][1])
 
-    # Thresholds recalibrados para a distribuição real do XGBoost PhysioNet 2019.
-    # O modelo retorna probabilidades comprimidas (típico: 0.10–0.60, raro > 0.60).
-    # Thresholds baseados em sensibilidade/especificidade do conjunto de validação.
-    if prob < 0.20:
+    # Score clínico baseado em qSOFA (Sepsis-3), SIRS e marcadores de choque.
+    # Compensa a baixa sensibilidade do XGBoost sem contexto ICULOS.
+    clinical_prob, detalhes_clinicos = _clinical_score(dados)
+
+    # Blend: 40% XGBoost (padrões epidemiológicos) + 60% critérios clínicos validados
+    blended_prob = xgb_prob * 0.40 + clinical_prob * 0.60
+    score = round(blended_prob * 100, 1)
+
+    if blended_prob < 0.10:
         risco = 'baixo'
         cor = 'green'
-        mensagem = 'Baixo risco de sepse nas proximas 6 horas'
-    elif prob < 0.35:
+        mensagem = 'Baixo risco de sepse'
+    elif blended_prob < 0.25:
         risco = 'moderado'
         cor = 'yellow'
         mensagem = 'Risco moderado — monitorar sinais vitais e lactato'
-    elif prob < 0.50:
+    elif blended_prob < 0.50:
         risco = 'alto'
         cor = 'orange'
         mensagem = 'Alto risco — considerar avaliacao imediata e culturas'
@@ -102,14 +174,18 @@ def predict_sepsis(dados: dict) -> dict:
 
     return {
         'score': score,
-        'probabilidade': prob,
+        'probabilidade': blended_prob,
         'risco': risco,
         'cor': cor,
         'mensagem': mensagem,
         'features_utilizadas': len(features_presentes),
         'features_imputadas': features_imputadas,
+        'componentes': {
+            'xgboost_score': round(xgb_prob * 100, 1),
+            **detalhes_clinicos,
+        },
         'auc_modelo': 0.8766,
-        'versao_modelo': '1.0.0-aldora-xgboost',
+        'versao_modelo': '1.1.0-aldora-blend-xgb-qsofa',
         'dataset_treino': 'PhysioNet2019 + MIMIC-IV + eICU',
         'disclaimer': 'Ferramenta de apoio à decisão clínica — CFM 2.454/2026',
     }
