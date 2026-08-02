@@ -445,6 +445,23 @@ class AldoraAI:
         except Exception as e:
             self._log.warning("%s indisponível: %s", label, e)
 
+    def _load_onnx_local(self, key: str, fname: str, label: str, min_mb: float = 1.0) -> None:
+        """Carrega ONNX de /app/models (bundled no image Docker)."""
+        path = f"/app/models/{fname}"
+        try:
+            import onnxruntime as ort
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"ONNX ausente: {path}")
+            size_mb = os.path.getsize(path) / 1e6
+            if size_mb < min_mb:
+                raise ValueError(f"ONNX muito pequeno ({size_mb:.1f}MB) — verificar arquivo")
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            sess = ort.InferenceSession(path, providers=providers)
+            self.registry[key] = sess
+            self._log.info("%s carregado (%s, %.1fMB).", label, fname, size_mb)
+        except Exception as e:
+            self._log.warning("%s indisponível: %s", label, e)
+
     def _load_brain_v2(self) -> None:
         """Carrega brain_tumor_v2_combined.onnx (binário sigmoid, AUC=0.9995, pesos embutidos 16.5MB).
         Se ausente, fallback para o PTH 4-classes."""
@@ -539,6 +556,8 @@ class AldoraAI:
         self._load_pth("onnx_glaucoma", "glaucoma_efficientnet_b0.pth",    "Glaucoma EfficientNet-B0")
         self._load_pth("onnx_mammo",    "mamografia_efficientnet_b0.pth",  "Mamografia EfficientNet-B0")
         self._load_pth("chestxray14",   "chestxray14_densenet121_v2.pth",  "ChestX-ray14 DenseNet-121")
+        self._load_onnx_local("onnx_tc_v4",    "tc_cranio_v4_ct.onnx",    "TC Crânio v4 CT",    min_mb=10.0)
+        self._load_onnx_local("onnx_mammo_v2", "mamografia_v2_busi.onnx", "Mamografia v2 BUSI", min_mb=10.0)
 
     # ── FastAPI ASGI App ────────────────────────────────────────────────────
 
@@ -913,5 +932,41 @@ class AldoraAI:
             if s is None:
                 raise HTTPException(503, "Mamografia não carregado.")
             return _onnx_infer(s, await image.read(), _ONNX_LABELS["mammography"], "mamografia_efficientnet_b0.pth")
+
+        @fast_app.post("/image/tc-cranio-v4")
+        async def img_tc_v4(image: UploadFile = File(...)):
+            s = reg.get("onnx_tc_v4")
+            if s is None:
+                raise HTTPException(503, "TC Crânio v4 não carregado.")
+            img_bytes = await image.read()
+            inp = _preprocess_onnx(img_bytes)
+            out = s.run(None, {s.get_inputs()[0].name: inp})[0][0]
+            raw = float(out) if out.size == 1 else float(out[0])
+            prob = float(1.0 / (1.0 + np.exp(-raw)))
+            label = "anormal" if prob > 0.5 else "normal"
+            conf = round(prob if label == "anormal" else 1.0 - prob, 4)
+            return {"predicao": label, "confianca": conf,
+                    "scores": {"normal": round(1.0 - prob, 4), "anormal": round(prob, 4)},
+                    "modelo_versao": "tc_cranio_v4_ct.onnx", "auc_treino": 0.9732,
+                    "disclaimer": DISCLAIMER_SHORT}
+
+        @fast_app.post("/image/mamografia-v2")
+        async def img_mammo_v2(image: UploadFile = File(...)):
+            """Ultrassom mamário BUSI — NÃO é mamografia convencional."""
+            s = reg.get("onnx_mammo_v2")
+            if s is None:
+                raise HTTPException(503, "Mamografia v2 não carregado.")
+            img_bytes = await image.read()
+            inp = _preprocess_onnx(img_bytes)
+            out = s.run(None, {s.get_inputs()[0].name: inp})[0][0]
+            raw = float(out) if out.size == 1 else float(out[0])
+            prob = float(1.0 / (1.0 + np.exp(-raw)))
+            label = "anormal" if prob > 0.5 else "normal"
+            conf = round(prob if label == "anormal" else 1.0 - prob, 4)
+            return {"predicao": label, "confianca": conf,
+                    "scores": {"normal": round(1.0 - prob, 4), "anormal": round(prob, 4)},
+                    "modelo_versao": "mamografia_v2_busi.onnx", "auc_treino": 0.9388,
+                    "modalidade": "ultrassom_mamario",
+                    "disclaimer": DISCLAIMER_SHORT}
 
         return fast_app
