@@ -89,7 +89,7 @@ DISCLAIMER_SHORT = "Ferramenta de apoio à decisão clínica. Decisão final é 
 # Labels ONNX — ordem dos neurônios de saída (hardcoded, não depende dos PKL)
 _ONNX_LABELS: dict[str, list[str]] = {
     "chest_xray":  ["normal", "anormal"],
-    "skin":        ["nv", "mel", "bkl", "bcc", "akiec", "vasc", "df"],
+    "skin":        ["mel", "nv", "bkl", "bcc", "akiec", "vasc", "df"],
     "retinopathy": ["grau_0", "grau_1", "grau_2", "grau_3", "grau_4"],
     "brain_tumor": ["glioma", "meningioma", "pituitary", "no_tumor"],
     "fracture":    ["normal", "fratura"],
@@ -411,7 +411,7 @@ class AldoraAI:
             "fractura_classes.pkl":      ["fractured", "normal"],
             "glaucoma_classes.pkl":      ["glaucoma", "normal"],
             "mamografia_classes.pkl":    ["anormal", "normal"],
-            "skin_label_encoder_gpu.pkl":["akiec", "bcc", "bkl", "df", "mel", "nv", "vasc"],
+            "skin_label_encoder_gpu.pkl":["mel", "nv", "bkl", "bcc", "akiec", "vasc", "df"],
             "eyepacs_label_encoder.pkl": ["grau_0", "grau_1", "grau_2", "grau_3", "grau_4"],
         }
         for fname, classes in encoders.items():
