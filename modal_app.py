@@ -34,8 +34,7 @@ DRIVE_MODELS = [
     ("eeg_epilepsy_combined_gbm.onnx",  "14NZlNndyoWoQtkaKNQTrO6-Etbopl5Oy"),
     ("circor_cardiac_gbm.onnx",         "1e45tncqP_2wAm9u_M5E07Y2TAasZaKkd"),
     ("lung_sound_ensemble.onnx",        "1kZjWbcNtdT3Tl7l3iXZWKMPNPP79OvA6"),
-    # Brain Tumor v2 ONNX binário (sigmoid) — requer .data file no mesmo diretório
-    # TODO: adicionar Drive ID do arquivo .data quando disponível
+    # Brain Tumor v2 ONNX binário sigmoid — pesos embutidos (16.5MB, AUC=0.9995)
     ("brain_tumor_v2_combined.onnx",   "1g-8rDCroAgSzSKbojwnN6qj9IK0cXSD9"),
     # Imagem — EfficientNet-B0 PTH
     ("skin_efficientnet_b0_gpu.pth",    "1djuI95JgSJt7nJ71mxFJsSLEU_cTljUI"),
@@ -447,24 +446,20 @@ class AldoraAI:
             self._log.warning("%s indisponível: %s", label, e)
 
     def _load_brain_v2(self) -> None:
-        """Carrega brain_tumor_v2_combined.onnx (binário sigmoid, AUC=0.9995).
-        Requer brain_tumor_v2_combined.onnx.data no mesmo diretório do Volume.
-        Se o .data file estiver ausente, fallback para o PTH 4-classes."""
+        """Carrega brain_tumor_v2_combined.onnx (binário sigmoid, AUC=0.9995, pesos embutidos 16.5MB).
+        Se ausente, fallback para o PTH 4-classes."""
         onnx_path = f"{MODEL_DIR}/brain_tumor_v2_combined.onnx"
-        data_path = f"{MODEL_DIR}/brain_tumor_v2_combined.onnx.data"
         try:
             import onnxruntime as ort
             if not os.path.exists(onnx_path):
                 raise FileNotFoundError(f"ONNX ausente: {onnx_path}")
-            if not os.path.exists(data_path):
-                raise FileNotFoundError(
-                    f"Arquivo de pesos externo ausente: {data_path} "
-                    f"(adicionar Drive ID do .data file em DRIVE_MODELS)"
-                )
+            size_mb = os.path.getsize(onnx_path) / 1e6
+            if size_mb < 10:
+                raise ValueError(f"ONNX muito pequeno ({size_mb:.1f}MB) — versão antiga sem pesos embutidos")
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
             sess = ort.InferenceSession(onnx_path, providers=providers)
             self.registry["onnx_brain_v2"] = sess
-            self._log.info("Brain Tumor v2 ONNX binário carregado (AUC=0.9995).")
+            self._log.info("Brain Tumor v2 ONNX binário carregado (AUC=0.9995, %.1fMB).", size_mb)
         except Exception as e:
             self._log.warning("Brain Tumor v2 indisponível: %s — usando PTH 4-classes.", e)
 
