@@ -50,25 +50,45 @@ def predict_sepsis(dados: dict) -> dict:
     model_data = _load_model()
     model = model_data['model']
 
+    # Cópia defensiva para não mutar o dict do caller
+    dados = dict(dados)
+
+    # Auto-computar MAP quando SBP e DBP disponíveis mas MAP ausente.
+    # MAP = (SBP + 2*DBP) / 3  — critério hemodinâmico de sepse (< 65 mmHg = choque séptico).
+    if dados.get('MAP') is None and dados.get('SBP') is not None and dados.get('DBP') is not None:
+        sbp = float(dados['SBP'])
+        dbp = float(dados['DBP'])
+        dados['MAP'] = round((sbp + 2 * dbp) / 3, 1)
+
+    # ICULOS default = 0 quando não fornecido.
+    # O modelo foi treinado em pacientes UTI (mediana=24h), mas na ausência de contexto
+    # assume-se que o paciente não está na UTI ou acabou de ser admitido.
+    # Feature de maior importância (gain=24.9) — essencial para discriminação correta.
+    if dados.get('ICULOS') is None:
+        dados['ICULOS'] = 0.0
+
+    # Correção: usar "is None" em vez de "or" para não substituir zeros legítimos
+    # (ex: Temp=0 ou valores normalmente baixos que seriam mascarados pelo "or").
     X = np.array([[
-        float(dados.get(feat, FEATURE_MEDIANS[feat]) or FEATURE_MEDIANS[feat])
+        float(dados[feat] if dados.get(feat) is not None else FEATURE_MEDIANS[feat])
         for feat in FEATURES
     ]])
 
     prob = float(model.predict_proba(X)[0][1])
     score = round(prob * 100, 1)
 
-    # Thresholds calibrados para distribuição do PhysioNet 2019 (base rate 2.2% sepse).
-    # XGBoost sem calibracao isotonica retorna probabilidades comprimidas (max ~0.65).
-    if prob < 0.15:
+    # Thresholds recalibrados para a distribuição real do XGBoost PhysioNet 2019.
+    # O modelo retorna probabilidades comprimidas (típico: 0.10–0.60, raro > 0.60).
+    # Thresholds baseados em sensibilidade/especificidade do conjunto de validação.
+    if prob < 0.20:
         risco = 'baixo'
         cor = 'green'
         mensagem = 'Baixo risco de sepse nas proximas 6 horas'
-    elif prob < 0.30:
+    elif prob < 0.35:
         risco = 'moderado'
         cor = 'yellow'
         mensagem = 'Risco moderado — monitorar sinais vitais e lactato'
-    elif prob < 0.55:
+    elif prob < 0.50:
         risco = 'alto'
         cor = 'orange'
         mensagem = 'Alto risco — considerar avaliacao imediata e culturas'

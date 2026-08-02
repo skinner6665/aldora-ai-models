@@ -601,7 +601,7 @@ async def predict_sepsis_endpoint(request: Request):
     """XGBoost Sepse — endpoint direto com JSON livre. Aceita subconjunto das features."""
     try:
         dados = await request.json()
-        # BUG 1 FIX: mapear campos PT-BR → EN (nomes das features do modelo XGBoost)
+        # Mapeamento PT-BR → EN (nomes das features do XGBoost PhysioNet 2019)
         _sepse_map = {
             'fc': 'HR', 'fr': 'Resp', 'temperatura': 'Temp',
             'pas': 'SBP', 'pad': 'DBP', 'spo2': 'O2Sat',
@@ -609,6 +609,7 @@ async def predict_sepsis_endpoint(request: Request):
             'pcr': 'CRP', 'pct': 'PCT', 'glasgow': 'GCS',
             'ventilacao_mecanica': 'Mech_Vent', 'vasopressor': 'Vasopressor',
             'idade': 'Age', 'genero': 'Gender',
+            'horas_uti': 'ICULOS',  # horas desde admissão na UTI (feature #1 do modelo)
         }
         dados_en = {_sepse_map.get(k, k): v for k, v in dados.items()}
         from models.sepse_model import predict_sepsis
