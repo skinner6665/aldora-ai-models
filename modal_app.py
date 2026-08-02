@@ -1,0 +1,879 @@
+"""
+Aldora AI Models — Modal.com GPU Deployment v4.0.0
+Migração Railway → Modal A10G
+Latência imagem: 2-5s (vs 50-110s Railway CPU)
+Endpoints: mesmos do main.py — interface REST idêntica
+CFM 2.454/2026 — apoio diagnóstico, não substituição clínica.
+"""
+import io
+import os
+import sys
+import base64
+import logging
+import pickle
+
+import numpy as np
+import modal
+
+# ─── Modal App ────────────────────────────────────────────────────────────────
+
+app = modal.App("aldora-ai-models")
+
+MODEL_DIR = "/models"
+volume = modal.Volume.from_name("aldora-models-v1", create_if_missing=True)
+
+# Modelos grandes → Google Drive → Volume (download na primeira inicialização)
+DRIVE_MODELS = [
+    # Tabular PKL/ONNX (não presentes localmente)
+    ("cardiac_xgboost_v2_combined.pkl", "1BrbaUR-c0mJl8n3flJA-o7VE497Hengl"),
+    ("preeclampsia_gbm.onnx",           "1hDiCSvuoa6dXdEWazr4R0zkINlOS6Gh1"),
+    ("mortality_gbm.onnx",              "1gUz8rXIhHK3M001_wcISCqtTAPjDMHEl"),
+    ("readmissao_gbm.onnx",             "1CjHBGeCm44LanRMUCWWi7kT2oNYmquqC"),
+    ("deterioracao_gbm.onnx",           "1CMg9igOO1Lg0d-_C-hjNeFXGN9idSgcT"),
+    ("vitaldb_ihi_v2.onnx",             "1rp03ROSuaOzQSuckVwojq-5pJqoHGDMG"),
+    ("eeg_epilepsy_combined_gbm.onnx",  "14NZlNndyoWoQtkaKNQTrO6-Etbopl5Oy"),
+    ("circor_cardiac_gbm.onnx",         "1e45tncqP_2wAm9u_M5E07Y2TAasZaKkd"),
+    ("lung_sound_ensemble.onnx",        "1kZjWbcNtdT3Tl7l3iXZWKMPNPP79OvA6"),
+    # Imagem — EfficientNet-B0 PTH
+    ("skin_efficientnet_b0_gpu.pth",    "1djuI95JgSJt7nJ71mxFJsSLEU_cTljUI"),
+    ("eyepacs_efficientnet_b0.pth",     "1Ja7DSuWfck-v397bAPAUHyTS9XlWhqzN"),
+    ("chest_xray_efficientnet_b0.pth",  "16O2beLazd8pXAKb6hizqEUSllppnilxE"),
+    ("brain_tumor_efficientnet_b0.pth", "1KpZgTrJmCCuEFPvMJ1DtJLDm4RPWL6Pd"),
+    ("fractura_efficientnet_b0.pth",    "1IINhfX72E3dNTegn-P_rcUDNHAFsUkGj"),
+    ("glaucoma_efficientnet_b0.pth",    "18-IrMNiiFn7YYWTsA1AkIwGk5DAOMuBa"),
+    ("mamografia_efficientnet_b0.pth",  "15rJ9FTgElUIaBdwEghEtR6sPdLs9DJyY"),
+    ("chestxray14_densenet121_v2.pth",  "14Zc7kRQB07JEGe9A6wqDpl92xNKKBq84"),
+]
+
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install(["libgl1", "libglib2.0-0", "libgomp1", "libsm6", "libxext6"])
+    .pip_install([
+        "fastapi>=0.115.0",
+        "uvicorn[standard]>=0.30.0",
+        "pydantic>=2.0.0",
+        "python-multipart>=0.0.9",
+        # PyTorch — versão com CUDA
+        "torch==2.2.2",
+        "torchvision==0.17.2",
+        "timm>=1.0.0",
+        "torchxrayvision>=1.0.1",
+        # ONNX Runtime com GPU
+        "onnxruntime-gpu>=1.18.0",
+        "numpy>=1.26.0,<2.0",
+        # Tabular
+        "xgboost>=2.0.0",
+        "scikit-learn>=1.4.0,<1.7",
+        "pandas>=2.2.0",
+        "joblib>=1.4.0",
+        "lightgbm==4.6.0",
+        "scipy>=1.10.0",
+        # Download / Pill
+        "gdown>=5.2.0",
+        "anthropic>=0.40.0",
+        "Pillow>=10.0.0",
+    ])
+    # Copia arquivos Python do projeto + PKL pequenos (já existem localmente)
+    .add_local_dir("models", remote_path="/app/models")
+)
+
+# ─── Constantes ───────────────────────────────────────────────────────────────
+
+DISCLAIMER_CFM = (
+    "AVISO REGULATÓRIO — CFM Resolução 2.454/2026: Este resultado é gerado por sistema de "
+    "apoio diagnóstico (SaMD/ANVISA). NÃO substitui avaliação clínica por profissional habilitado. "
+    "Não comunicar ao paciente sem mediação do médico responsável."
+)
+DISCLAIMER_SHORT = "Ferramenta de apoio à decisão clínica. Decisão final é do médico. CFM 2.454/2026."
+
+# Labels ONNX — ordem dos neurônios de saída (hardcoded, não depende dos PKL)
+_ONNX_LABELS: dict[str, list[str]] = {
+    "chest_xray":  ["normal", "anormal"],
+    "skin":        ["nv", "mel", "bkl", "bcc", "akiec", "vasc", "df"],
+    "retinopathy": ["grau_0", "grau_1", "grau_2", "grau_3", "grau_4"],
+    "brain_tumor": ["glioma", "meningioma", "pituitary", "no_tumor"],
+    "fracture":    ["normal", "fratura"],
+    "glaucoma":    ["normal", "glaucoma"],
+    "mammography": ["normal", "anormal"],
+}
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _ts() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _softmax(x: np.ndarray) -> np.ndarray:
+    e = np.exp(x - x.max())
+    return e / e.sum()
+
+
+def _preprocess_onnx(image_bytes: bytes) -> np.ndarray:
+    from PIL import Image
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB").resize((224, 224))
+    arr = np.array(img, dtype=np.float32) / 255.0
+    arr = (arr - np.array([0.485, 0.456, 0.406], dtype=np.float32)) \
+        / np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    return arr.transpose(2, 0, 1)[np.newaxis].astype(np.float32)
+
+
+_PTH_CACHE: dict = {}
+
+def _onnx_infer(session, image_bytes: bytes, labels: list[str], model_file: str) -> dict:
+    inp = _preprocess_onnx(image_bytes)
+    if isinstance(session, str):
+        # PTH path — EfficientNet-B0 com GPU
+        import torch
+        if session not in _PTH_CACHE:
+            checkpoint = torch.load(session, map_location="cpu", weights_only=False)
+            if isinstance(checkpoint, dict):
+                from torchvision.models import efficientnet_b0
+                model = efficientnet_b0(weights=None)
+                in_f = model.classifier[1].in_features
+                model.classifier[1] = torch.nn.Linear(in_f, len(labels))
+                state = {k.replace("module.", ""): v for k, v in checkpoint.items()}
+                model.load_state_dict(state, strict=False)
+            else:
+                model = checkpoint
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            model = model.to(device).eval()
+            _PTH_CACHE[session] = model
+        m = _PTH_CACHE[session]
+        device = next(m.parameters()).device
+        t = torch.tensor(inp).to(device)
+        with torch.no_grad():
+            out = torch.softmax(m(t), dim=1)[0].cpu().numpy()
+    else:
+        out = session.run(None, {session.get_inputs()[0].name: inp})[0][0]
+        if abs(float(out.sum()) - 1.0) > 0.05:
+            out = _softmax(out)
+
+    idx = int(out.argmax())
+    return {
+        "predicao":      labels[idx],
+        "confianca":     round(float(out[idx]), 4),
+        "scores":        {labels[i]: round(float(out[i]), 4) for i in range(len(labels))},
+        "modelo_versao": model_file,
+        "disclaimer":    DISCLAIMER_SHORT,
+    }
+
+
+def _tabular_infer(model, values: list, features: list[str], model_file: str) -> dict:
+    try:
+        from onnxruntime import InferenceSession as _OrtSession
+        if isinstance(model, _OrtSession):
+            arr = np.array([values], dtype=np.float32)
+            outputs = model.run(None, {model.get_inputs()[0].name: arr})
+            if len(outputs) >= 2:
+                proba_raw = outputs[1]
+                if isinstance(proba_raw, list) and proba_raw and isinstance(proba_raw[0], dict):
+                    p1 = float(proba_raw[0].get(1, proba_raw[0].get("1", 0.5)))
+                    p0 = 1.0 - p1
+                elif hasattr(proba_raw, "shape") and len(proba_raw.shape) == 2:
+                    p0, p1 = float(proba_raw[0][0]), float(proba_raw[0][1])
+                else:
+                    p1 = float(outputs[0][0])
+                    p0 = 1.0 - p1
+            else:
+                p1 = float(outputs[0][0])
+                p0 = 1.0 - p1
+            label = "1" if p1 >= 0.5 else "0"
+            return {
+                "predicao": label, "confianca": round(max(p0, p1), 4),
+                "scores": {"0": round(p0, 4), "1": round(p1, 4)},
+                "modelo_versao": model_file, "disclaimer": DISCLAIMER_SHORT,
+            }
+    except ImportError:
+        pass
+
+    import pandas as pd
+    X = pd.DataFrame([dict(zip(features, values))])
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(X)[0]
+        classes = [str(c) for c in (model.classes_ if hasattr(model, "classes_") else range(len(proba)))]
+        idx = int(proba.argmax())
+        return {
+            "predicao": classes[idx], "confianca": round(float(proba[idx]), 4),
+            "scores": {c: round(float(p), 4) for c, p in zip(classes, proba)},
+            "modelo_versao": model_file, "disclaimer": DISCLAIMER_SHORT,
+        }
+    pred = float(model.predict(X)[0])
+    label = "1" if pred >= 0.5 else "0"
+    return {
+        "predicao": label, "confianca": round(abs(pred - 0.5) + 0.5, 4),
+        "scores": {"0": round(1.0 - pred, 4), "1": round(pred, 4)},
+        "modelo_versao": model_file, "disclaimer": DISCLAIMER_SHORT,
+    }
+
+
+# ─── Sepse: score híbrido XGBoost + qSOFA/SIRS (v1.1.0) ────────────────────
+
+_SEPSE_FEATURES = [
+    "HR", "O2Sat", "Temp", "SBP", "MAP", "DBP", "Resp",
+    "BUN", "Glucose", "Lactate", "Potassium", "Creatinine",
+    "Hct", "Hgb", "WBC", "Platelets", "Age", "Gender", "ICULOS",
+]
+_SEPSE_MEDIANS: dict = {
+    "HR": 83.0, "O2Sat": 97.0, "Temp": 36.9, "SBP": 122.0,
+    "MAP": 82.0, "DBP": 63.0, "Resp": 18.0, "BUN": 18.0,
+    "Glucose": 128.0, "Lactate": 1.6, "Potassium": 4.0,
+    "Creatinine": 0.9, "Hct": 31.6, "Hgb": 10.7,
+    "WBC": 10.7, "Platelets": 213.0, "Age": 62.0, "Gender": 1.0, "ICULOS": 24.0,
+}
+_SEPSE_PT_MAP = {
+    "fc": "HR", "fr": "Resp", "temperatura": "Temp",
+    "pas": "SBP", "pad": "DBP", "spo2": "O2Sat",
+    "lactato": "Lactate", "leucocitos": "WBC",
+    "pcr": "CRP", "pct": "PCT", "glasgow": "GCS",
+    "ventilacao_mecanica": "Mech_Vent", "vasopressor": "Vasopressor",
+    "idade": "Age", "genero": "Gender",
+    "horas_uti": "ICULOS",
+}
+_sepse_xgb_model = None
+
+def _load_sepse_xgb():
+    global _sepse_xgb_model
+    if _sepse_xgb_model is None:
+        path = "/app/models/sepsis_xgboost.pkl"
+        with open(path, "rb") as f:
+            _sepse_xgb_model = pickle.load(f)["model"]
+    return _sepse_xgb_model
+
+
+def _clinical_score_sepse(dados: dict) -> tuple:
+    qsofa = 0
+    gcs = dados.get("GCS")
+    resp = dados.get("Resp")
+    sbp = dados.get("SBP")
+    hr = dados.get("HR")
+    temp = dados.get("Temp")
+    wbc = dados.get("WBC")
+    lactate = dados.get("Lactate")
+    map_val = dados.get("MAP")
+    spo2 = dados.get("O2Sat")
+
+    if gcs is not None and float(gcs) < 15:
+        qsofa += 1
+    if resp is not None and float(resp) >= 22:
+        qsofa += 1
+    if sbp is not None and float(sbp) <= 100:
+        qsofa += 1
+
+    sirs = 0
+    if temp is not None:
+        t = float(temp)
+        if t > 38.3 or t < 36.0:
+            sirs += 1
+    if hr is not None and float(hr) > 90:
+        sirs += 1
+    if resp is not None and float(resp) > 20:
+        sirs += 1
+    if wbc is not None:
+        w = float(wbc)
+        if w > 12.0 or w < 4.0:
+            sirs += 1
+
+    lactato_comp = 0.0
+    if lactate is not None and float(lactate) > 2.0:
+        lactato_comp = min(1.0, (float(lactate) - 2.0) / 4.0)
+
+    map_comp = 0.0
+    if map_val is not None and float(map_val) < 65.0:
+        map_comp = min(1.0, (65.0 - float(map_val)) / 30.0)
+
+    spo2_comp = 0.0
+    if spo2 is not None and float(spo2) < 94.0:
+        spo2_comp = min(1.0, (94.0 - float(spo2)) / 10.0)
+
+    clinical_prob = (
+        (qsofa / 3.0) * 0.35 +
+        (sirs / 4.0) * 0.20 +
+        lactato_comp * 0.20 +
+        map_comp * 0.15 +
+        spo2_comp * 0.10
+    )
+    detalhes = {
+        "qsofa": qsofa, "sirs": sirs,
+        "lactato_critico": lactate is not None and float(lactate) > 2.0,
+        "map_choque": map_val is not None and float(map_val) < 65.0,
+        "hipoxemia": spo2 is not None and float(spo2) < 94.0,
+    }
+    return clinical_prob, detalhes
+
+
+def predict_sepsis_hybrid(dados_en: dict) -> dict:
+    dados = dict(dados_en)
+    if dados.get("MAP") is None and dados.get("SBP") is not None and dados.get("DBP") is not None:
+        dados["MAP"] = round((float(dados["SBP"]) + 2 * float(dados["DBP"])) / 3, 1)
+    if dados.get("ICULOS") is None:
+        dados["ICULOS"] = 0.0
+
+    model = _load_sepse_xgb()
+    X = np.array([[
+        float(dados[f] if dados.get(f) is not None else _SEPSE_MEDIANS[f])
+        for f in _SEPSE_FEATURES
+    ]])
+    xgb_prob = float(model.predict_proba(X)[0][1])
+
+    clinical_prob, detalhes = _clinical_score_sepse(dados)
+    blended = xgb_prob * 0.40 + clinical_prob * 0.60
+    score = round(blended * 100, 1)
+
+    if blended < 0.10:
+        risco, cor, msg = "baixo", "green", "Baixo risco de sepse"
+    elif blended < 0.25:
+        risco, cor, msg = "moderado", "yellow", "Risco moderado — monitorar sinais vitais e lactato"
+    elif blended < 0.50:
+        risco, cor, msg = "alto", "orange", "Alto risco — considerar avaliacao imediata e culturas"
+    else:
+        risco, cor, msg = "critico", "red", "Risco critico — protocolo de sepse recomendado"
+
+    features_ok = [f for f in _SEPSE_FEATURES if dados.get(f) is not None]
+    features_imp = [f for f in _SEPSE_FEATURES if dados.get(f) is None]
+
+    return {
+        "score": score, "probabilidade": blended, "risco": risco, "cor": cor,
+        "mensagem": msg, "features_utilizadas": len(features_ok),
+        "features_imputadas": features_imp,
+        "componentes": {"xgboost_score": round(xgb_prob * 100, 1), **detalhes},
+        "auc_modelo": 0.8766, "versao_modelo": "1.1.0-aldora-blend-xgb-qsofa",
+        "dataset_treino": "PhysioNet2019 + MIMIC-IV + eICU",
+        "disclaimer": DISCLAIMER_SHORT,
+    }
+
+
+# ─── AldoraAI Modal Class ─────────────────────────────────────────────────────
+
+@app.cls(
+    gpu="A10G",
+    volumes={MODEL_DIR: volume},
+    image=image,
+    timeout=600,
+)
+class AldoraAI:
+
+    @modal.enter()
+    def startup(self) -> None:
+        """Executa na inicialização do container: download + carregamento de modelos."""
+        logging.basicConfig(level=logging.INFO)
+        self._log = logging.getLogger("aldora-modal")
+
+        # Garante que /app/models está no path Python
+        if "/app" not in sys.path:
+            sys.path.insert(0, "/app")
+
+        # Torna o diretório de modelos persistente e cria subdiretórios
+        os.makedirs(MODEL_DIR, exist_ok=True)
+
+        # Cache torchxrayvision → Volume (evita re-download a cada cold start)
+        os.environ["TORCH_HOME"] = MODEL_DIR
+
+        self._download_drive_models()
+        self._create_label_pkls()
+        self._load_all_models()
+        self._log.info("AldoraAI pronto. Modelos: %d", len(self.registry))
+
+    def _download_drive_models(self) -> None:
+        try:
+            import gdown
+        except ImportError:
+            os.system(f"{sys.executable} -m pip install gdown -q")
+            import gdown
+
+        errors = []
+        for fname, fid in DRIVE_MODELS:
+            dest = f"{MODEL_DIR}/{fname}"
+            if os.path.exists(dest) and os.path.getsize(dest) > 100_000:
+                self._log.info("[SKIP] %s", fname)
+                continue
+            url = f"https://drive.google.com/uc?id={fid}"
+            self._log.info("[DOWN] %s ...", fname)
+            try:
+                gdown.download(url, dest, quiet=True)
+                if os.path.exists(dest) and os.path.getsize(dest) > 100_000:
+                    self._log.info("[OK] %s (%.1f MB)", fname, os.path.getsize(dest) / 1e6)
+                else:
+                    raise FileNotFoundError("arquivo vazio ou muito pequeno após download")
+            except Exception as e:
+                self._log.warning("[ERR] %s: %s", fname, e)
+                errors.append(fname)
+        if errors:
+            self._log.warning("Falhas no download: %s — endpoints afetados retornam 503", errors)
+        volume.commit()
+
+    def _create_label_pkls(self) -> None:
+        """Recria PKLs de label encoders no Volume se ausentes."""
+        encoders = {
+            "chest_xray_classes.pkl":    ["anormal", "normal"],
+            "brain_tumor_classes.pkl":   ["glioma", "meningioma", "notumor", "pituitary"],
+            "fractura_classes.pkl":      ["fractured", "normal"],
+            "glaucoma_classes.pkl":      ["glaucoma", "normal"],
+            "mamografia_classes.pkl":    ["anormal", "normal"],
+            "skin_label_encoder_gpu.pkl":["akiec", "bcc", "bkl", "df", "mel", "nv", "vasc"],
+            "eyepacs_label_encoder.pkl": ["grau_0", "grau_1", "grau_2", "grau_3", "grau_4"],
+        }
+        for fname, classes in encoders.items():
+            path = f"{MODEL_DIR}/{fname}"
+            if not os.path.exists(path):
+                with open(path, "wb") as f:
+                    pickle.dump(classes, f)
+        volume.commit()
+
+    def _load_pth(self, key: str, fname: str, label: str) -> None:
+        path = f"{MODEL_DIR}/{fname}"
+        try:
+            if not os.path.exists(path) or os.path.getsize(path) < 100_000:
+                raise FileNotFoundError(f"ausente ou vazio: {path}")
+            self.registry[key] = path
+            self._log.info("%s registrado (%s).", label, fname)
+        except Exception as e:
+            self._log.warning("%s indisponível: %s", label, e)
+
+    def _load_onnx(self, key: str, fname: str, label: str) -> None:
+        path = f"{MODEL_DIR}/{fname}"
+        try:
+            import onnxruntime as ort
+            if not os.path.exists(path) or os.path.getsize(path) < 1000:
+                raise FileNotFoundError(f"ausente ou vazio: {path}")
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            self.registry[key] = ort.InferenceSession(path, providers=providers)
+            self._log.info("%s carregado (%s).", label, fname)
+        except Exception as e:
+            self._log.warning("%s indisponível: %s", label, e)
+
+    def _load_pkl(self, key: str, fname: str, label: str, volume_path: bool = True) -> None:
+        path = f"{MODEL_DIR}/{fname}" if volume_path else f"/app/models/{fname}"
+        try:
+            import joblib
+            if not os.path.exists(path) or os.path.getsize(path) < 100:
+                raise FileNotFoundError(f"ausente: {path}")
+            self.registry[key] = joblib.load(path)
+            self._log.info("%s carregado (%s).", label, fname)
+        except Exception as e:
+            self._log.warning("%s indisponível: %s", label, e)
+
+    def _load_all_models(self) -> None:
+        self.registry: dict = {}
+
+        # CheXpert — DenseNet121 (torchxrayvision auto-download)
+        try:
+            from models.chexpert_model import load_chexpert
+            self.registry["chexpert"] = load_chexpert()
+            self._log.info("CheXpert carregado.")
+        except Exception as e:
+            self._log.warning("CheXpert indisponível: %s", e)
+
+        # ECG — rule-based + LightGBM PTB-XL
+        try:
+            from models.ecg_model import load_ecg
+            self.registry["ecg"] = load_ecg()
+            self._log.info("ECG LightGBM PTB-XL carregado.")
+        except Exception as e:
+            self._log.warning("ECG indisponível: %s", e)
+
+        # Derma — EfficientNet-B4 HAM10000
+        try:
+            from models.derma_model import load_derma
+            self.registry["derma"] = load_derma()
+            self._log.info("Derma EfficientNet-B4 carregado.")
+        except Exception as e:
+            self._log.warning("Derma indisponível: %s", e)
+
+        # Pill Identifier — Claude Vision
+        try:
+            from models.pill_model import load_pill
+            self.registry["pill"] = load_pill()
+            self._log.info("Pill Identifier (Claude Vision) carregado.")
+        except Exception as e:
+            self._log.warning("Pill Identifier indisponível: %s", e)
+
+        # Sepse XGBoost — pre-load para evitar cold start nas primeiras chamadas
+        try:
+            _load_sepse_xgb()
+            self.registry["sepse"] = "xgboost-blend-v1.1.0"
+            self._log.info("Sepse XGBoost+qSOFA carregado.")
+        except Exception as e:
+            self._log.warning("Sepse indisponível: %s", e)
+
+        # Tabular — Drive → Volume
+        self._load_pkl("cardiac",       "cardiac_xgboost_v2_combined.pkl", "Cardiac XGBoost v2")
+        self._load_onnx("preeclampsia", "preeclampsia_gbm.onnx",           "Preeclampsia GBM")
+        self._load_onnx("mortality",    "mortality_gbm.onnx",               "Mortality GBM")
+        self._load_onnx("readmissao",   "readmissao_gbm.onnx",              "Readmissão GBM")
+        self._load_onnx("deterioracao", "deterioracao_gbm.onnx",            "Deterioração GBM")
+        self._load_onnx("vitaldb",      "vitaldb_ihi_v2.onnx",              "VitalDB IHI v2")
+        self._load_onnx("eeg",          "eeg_epilepsy_combined_gbm.onnx",   "EEG Epilepsia GBM")
+        self._load_onnx("circor",       "circor_cardiac_gbm.onnx",          "CirCor Cardiac GBM")
+        self._load_onnx("lung_sound",   "lung_sound_ensemble.onnx",         "Lung Sound Ensemble")
+
+        # Imagem — PTH EfficientNet-B0 (GPU A10G)
+        self._load_pth("onnx_skin",     "skin_efficientnet_b0_gpu.pth",    "Skin EfficientNet-B0")
+        self._load_pth("onnx_retina",   "eyepacs_efficientnet_b0.pth",     "EyePACS EfficientNet-B0")
+        self._load_pth("onnx_chest",    "chest_xray_efficientnet_b0.pth",  "Chest XR EfficientNet-B0")
+        self._load_pth("onnx_brain",    "brain_tumor_efficientnet_b0.pth", "Brain Tumor EfficientNet-B0")
+        self._load_pth("onnx_fracture", "fractura_efficientnet_b0.pth",    "Fratura EfficientNet-B0")
+        self._load_pth("onnx_glaucoma", "glaucoma_efficientnet_b0.pth",    "Glaucoma EfficientNet-B0")
+        self._load_pth("onnx_mammo",    "mamografia_efficientnet_b0.pth",  "Mamografia EfficientNet-B0")
+        self._load_pth("chestxray14",   "chestxray14_densenet121_v2.pth",  "ChestX-ray14 DenseNet-121")
+
+    # ── FastAPI ASGI App ────────────────────────────────────────────────────
+
+    @modal.asgi_app(label="api")
+    def serve(self):
+        from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+        from fastapi.middleware.cors import CORSMiddleware
+        from pydantic import BaseModel
+
+        fast_app = FastAPI(
+            title="Aldora AI Models — Modal GPU",
+            version="4.0.0",
+            description="31 modelos IA médica. GPU A10G. CFM 2.454/2026.",
+        )
+        fast_app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["Content-Type", "Authorization"],
+        )
+
+        # ── Schemas ─────────────────────────────────────────────────────────
+
+        class ImageRequest(BaseModel):
+            image_base64: str
+            image_mime: str = "image/jpeg"
+            paciente_id: str | None = None
+
+        class ECGRequest(BaseModel):
+            fc: float; pr_ms: float; qrs_ms: float; qtc_ms: float
+            rr_variability: float = 0.0; paciente_id: str | None = None
+
+        class ECGSignalsRequest(BaseModel):
+            leads_100hz: list[list[float]]
+            fc: float | None = 0.0; pr_ms: float | None = 0.0
+            qrs_ms: float | None = 0.0; qtc_ms: float | None = 0.0
+            rr_variability: float | None = 0.0; paciente_id: str | None = None
+
+        class SepseRequest(BaseModel):
+            hr: float | None = None; o2sat: float | None = None
+            temp: float | None = None; sbp: float | None = None
+            map: float | None = None; dbp: float | None = None
+            resp: float | None = None; bun: float | None = None
+            glucose: float | None = None; lactate: float | None = None
+            potassium: float | None = None; creatinine: float | None = None
+            hct: float | None = None; hgb: float | None = None
+            wbc: float | None = None; platelets: float | None = None
+            age: float | None = None; gender: float | None = None
+            icu_los_days: float | None = None; paciente_id: str | None = None
+
+        class CardiacRequest(BaseModel):
+            murmur_presence: float | None = 0.0; age_years: float | None = 30.0
+            sex: float | None = 0.0; pregnancy_status: float | None = 0.0
+            campaign: float | None = 1.0
+
+        class PreeclampsiaRequest(BaseModel):
+            age: float | None = 25.0; bmi: float | None = 22.0
+            systolic_bp: float | None = 120.0; diastolic_bp: float | None = 80.0
+            mean_arterial_pressure: float | None = 93.0; proteinuria: float | None = 0.0
+            creatinine: float | None = 0.8; platelets: float | None = 250.0
+            alt: float | None = 20.0; ast: float | None = 20.0
+            gestational_age: float | None = 28.0
+
+        class MortalityRequest(BaseModel):
+            age: float | None = 50.0; sofa_score: float | None = 0.0
+            apache_ii: float | None = 0.0; gcs: float | None = 15.0
+            lactate: float | None = 1.0; creatinine: float | None = 0.8
+            bilirubin: float | None = 0.5; platelets: float | None = 250.0
+            pao2_fio2: float | None = 400.0; vasopressors: float | None = 0.0
+
+        class ReadmissaoRequest(BaseModel):
+            age: float | None = 50.0; length_of_stay: float | None = 5.0
+            charlson_index: float | None = 0.0; lace_score: float | None = 5.0
+            previous_admissions: float | None = 0.0; diagnosis_icd: float | None = 0.0
+            acuity: float | None = 1.0
+
+        class DeterioracaoRequest(BaseModel):
+            news2_score: float | None = 0.0; delta_fc: float | None = 0.0
+            delta_fr: float | None = 0.0; delta_pas: float | None = 0.0
+            delta_temperatura: float | None = 0.0; delta_saturacao: float | None = 0.0
+            delta_glasgow: float | None = 0.0; suporte_o2: float | None = 0.0
+
+        class VitalDBRequest(BaseModel):
+            mbp: float | None = 80.0; hr: float | None = 70.0
+            spo2: float | None = 98.0; etco2: float | None = 35.0
+            bis: float | None = 50.0; temperature: float | None = 36.5
+            age: float | None = 50.0; asa_class: float | None = 2.0
+            operation_type: float | None = 0.0
+
+        class EEGRequest(BaseModel):
+            delta_power: float | None = 0.0; theta_power: float | None = 0.0
+            alpha_power: float | None = 0.0; beta_power: float | None = 0.0
+            gamma_power: float | None = 0.0; spectral_entropy: float | None = 0.0
+            hjorth_mobility: float | None = 0.0; hjorth_complexity: float | None = 0.0
+
+        class CircorRequest(BaseModel):
+            age_months: float | None = 120.0; weight: float | None = 20.0
+            height: float | None = 110.0; sex: float | None = 0.0
+            murmur_locations: float | None = 0.0
+            systolic_murmur_timing: float | None = 0.0
+            diastolic_murmur_timing: float | None = 0.0
+
+        class LungSoundRequest(BaseModel):
+            mfcc_mean: float | None = 0.0; mfcc_std: float | None = 0.0
+            spectral_centroid: float | None = 0.0
+            zero_crossing_rate: float | None = 0.0; rms_energy: float | None = 0.0
+
+        reg = self.registry
+
+        # ── Endpoints ────────────────────────────────────────────────────────
+
+        @fast_app.get("/health")
+        def health():
+            return {
+                "status": "ok",
+                "modelos": {k: "carregado" for k in reg},
+                "total": len(reg),
+                "versao": "4.0.0-modal-gpu",
+                "gpu": "A10G",
+                "timestamp": _ts(),
+            }
+
+        # ── Legados ──────────────────────────────────────────────────────────
+
+        @fast_app.post("/v1/chexpert")
+        async def chexpert(req: ImageRequest):
+            m = reg.get("chexpert")
+            if m is None:
+                raise HTTPException(503, "CheXpert não carregado.")
+            resultado = m.predict(base64.b64decode(req.image_base64))
+            top_conf = resultado[0]["probabilidade"] if resultado else 0.0
+            return {"resultado": resultado, "confianca": round(top_conf, 4),
+                    "modelo": "torchxrayvision/densenet121-res224-all",
+                    "aviso": DISCLAIMER_CFM, "timestamp": _ts()}
+
+        @fast_app.post("/v1/ecg")
+        async def ecg_rule(req: ECGRequest):
+            m = reg.get("ecg")
+            if m is None:
+                raise HTTPException(503, "ECG não carregado.")
+            resultado = m.predict(req.fc, req.pr_ms, req.qrs_ms, req.qtc_ms, req.rr_variability)
+            achados = resultado.get("achados", [])
+            return {"resultado": resultado,
+                    "confianca": round(achados[0]["probabilidade"], 4) if achados else 0.0,
+                    "modelo": "rule-based-ecg-v1", "aviso": DISCLAIMER_CFM, "timestamp": _ts()}
+
+        @fast_app.post("/ecg/analyze-signals")
+        async def ecg_signals(req: ECGSignalsRequest):
+            m = reg.get("ecg")
+            if m is None:
+                raise HTTPException(503, "ECG não carregado.")
+            result = m.predict_from_signals(
+                leads_100hz=req.leads_100hz,
+                fc=req.fc or 0.0, pr_ms=req.pr_ms or 0.0,
+                qrs_ms=req.qrs_ms or 0.0, qtc_ms=req.qtc_ms or 0.0,
+                rr_variability=req.rr_variability or 0.0,
+            )
+            return {"resultado": result,
+                    "confianca": round(float(result.get("top_probabilidade", 0.0)), 4),
+                    "modelo": result.get("modelo", "lgbm_ptbxl"),
+                    "aviso": DISCLAIMER_CFM, "timestamp": _ts()}
+
+        @fast_app.post("/v1/derma")
+        async def derma(req: ImageRequest):
+            m = reg.get("derma")
+            if m is None:
+                raise HTTPException(503, "Derma não carregado.")
+            resultado = m.predict(base64.b64decode(req.image_base64))
+            top_conf = resultado[0]["probabilidade"] if resultado else 0.0
+            return {"resultado": resultado, "confianca": round(top_conf, 4),
+                    "modelo": "efficientnet_b4-ham10000", "aviso": DISCLAIMER_CFM, "timestamp": _ts()}
+
+        @fast_app.post("/v1/pill")
+        async def pill(req: ImageRequest):
+            m = reg.get("pill")
+            if m is None:
+                raise HTTPException(503, "Pill Identifier não carregado. Verifique ANTHROPIC_API_KEY.")
+            resultado = m.predict(base64.b64decode(req.image_base64), req.image_mime)
+            nivel = resultado.get("confianca", "baixa")
+            return {"resultado": resultado,
+                    "confianca": {"alta": 0.90, "media": 0.65, "baixa": 0.35}.get(nivel, 0.35),
+                    "modelo": "claude-sonnet-4-6-vision", "aviso": DISCLAIMER_CFM, "timestamp": _ts()}
+
+        # ── Sepse ─────────────────────────────────────────────────────────────
+
+        @fast_app.post("/v1/sepse")
+        async def sepse_v1(req: SepseRequest):
+            dados_en = {
+                "HR": req.hr, "O2Sat": req.o2sat, "Temp": req.temp,
+                "SBP": req.sbp, "MAP": req.map, "DBP": req.dbp, "Resp": req.resp,
+                "BUN": req.bun, "Glucose": req.glucose, "Lactate": req.lactate,
+                "Potassium": req.potassium, "Creatinine": req.creatinine,
+                "Hct": req.hct, "Hgb": req.hgb, "WBC": req.wbc,
+                "Platelets": req.platelets, "Age": req.age, "Gender": req.gender,
+                "ICULOS": req.icu_los_days,
+                "GCS": None,
+            }
+            resultado = predict_sepsis_hybrid(dados_en)
+            return {"resultado": resultado, "confianca": resultado["probabilidade"],
+                    "modelo": "xgboost-blend-qsofa-v1.1.0",
+                    "aviso": DISCLAIMER_CFM, "timestamp": _ts()}
+
+        @fast_app.post("/sepsis/predict")
+        async def sepsis_predict(request: Request):
+            try:
+                dados = await request.json()
+                dados_en = {_SEPSE_PT_MAP.get(k, k): v for k, v in dados.items()}
+                resultado = predict_sepsis_hybrid(dados_en)
+                return {"success": True, "data": resultado}
+            except Exception as e:
+                return {"success": False, "error": str(e), "score": 50, "risco": "indeterminado"}
+
+        # ── Tabular ─────────────────────────────────────────────────────────
+
+        @fast_app.post("/cardiac/predict")
+        async def cardiac(req: CardiacRequest):
+            m = reg.get("cardiac")
+            if m is None:
+                raise HTTPException(503, "Cardiac XGBoost não carregado.")
+            features = ["murmur_presence", "age_years", "sex", "pregnancy_status", "campaign"]
+            values = [req.murmur_presence, req.age_years, req.sex, req.pregnancy_status, req.campaign]
+            return _tabular_infer(m, values, features, "cardiac_xgboost_v2_combined.pkl")
+
+        @fast_app.post("/preeclampsia/predict")
+        async def preeclampsia(req: PreeclampsiaRequest):
+            m = reg.get("preeclampsia")
+            if m is None:
+                raise HTTPException(503, "Preeclampsia GBM não carregado.")
+            features = ["age", "bmi", "systolic_bp", "diastolic_bp", "mean_arterial_pressure",
+                        "proteinuria", "creatinine", "platelets", "alt", "ast", "gestational_age"]
+            values = [req.age, req.bmi, req.systolic_bp, req.diastolic_bp, req.mean_arterial_pressure,
+                      req.proteinuria, req.creatinine, req.platelets, req.alt, req.ast, req.gestational_age]
+            return _tabular_infer(m, values, features, "preeclampsia_gbm.onnx")
+
+        @fast_app.post("/mortality/predict")
+        async def mortality(req: MortalityRequest):
+            m = reg.get("mortality")
+            if m is None:
+                raise HTTPException(503, "Mortality GBM não carregado.")
+            features = ["age", "sofa_score", "apache_ii", "gcs", "lactate",
+                        "creatinine", "bilirubin", "platelets", "pao2_fio2", "vasopressors"]
+            values = [req.age, req.sofa_score, req.apache_ii, req.gcs, req.lactate,
+                      req.creatinine, req.bilirubin, req.platelets, req.pao2_fio2, req.vasopressors]
+            return _tabular_infer(m, values, features, "mortality_gbm.onnx")
+
+        @fast_app.post("/readmissao/predict")
+        async def readmissao(req: ReadmissaoRequest):
+            m = reg.get("readmissao")
+            if m is None:
+                raise HTTPException(503, "Readmissão GBM não carregado.")
+            features = ["age", "length_of_stay", "charlson_index", "lace_score",
+                        "previous_admissions", "diagnosis_icd", "acuity"]
+            values = [req.age, req.length_of_stay, req.charlson_index, req.lace_score,
+                      req.previous_admissions, req.diagnosis_icd, req.acuity]
+            return _tabular_infer(m, values, features, "readmissao_gbm.onnx")
+
+        @fast_app.post("/deterioracao/predict")
+        async def deterioracao(req: DeterioracaoRequest):
+            m = reg.get("deterioracao")
+            if m is None:
+                raise HTTPException(503, "Deterioração GBM não carregado.")
+            features = ["news2_score", "delta_fc", "delta_fr", "delta_pas",
+                        "delta_temperatura", "delta_saturacao", "delta_glasgow", "suporte_o2"]
+            values = [req.news2_score, req.delta_fc, req.delta_fr, req.delta_pas,
+                      req.delta_temperatura, req.delta_saturacao, req.delta_glasgow, req.suporte_o2]
+            return _tabular_infer(m, values, features, "deterioracao_gbm.onnx")
+
+        @fast_app.post("/vitaldb/predict")
+        async def vitaldb(req: VitalDBRequest):
+            m = reg.get("vitaldb")
+            if m is None:
+                raise HTTPException(503, "VitalDB não carregado.")
+            features = ["mbp", "hr", "spo2", "etco2", "bis", "temperature",
+                        "age", "asa_class", "operation_type"]
+            values = [req.mbp, req.hr, req.spo2, req.etco2, req.bis, req.temperature,
+                      req.age, req.asa_class, req.operation_type]
+            return _tabular_infer(m, values, features, "vitaldb_ihi_v2.onnx")
+
+        @fast_app.post("/eeg/predict")
+        async def eeg(req: EEGRequest):
+            m = reg.get("eeg")
+            if m is None:
+                raise HTTPException(503, "EEG não carregado.")
+            features = ["delta_power", "theta_power", "alpha_power", "beta_power", "gamma_power",
+                        "spectral_entropy", "hjorth_mobility", "hjorth_complexity"]
+            values = [req.delta_power, req.theta_power, req.alpha_power, req.beta_power, req.gamma_power,
+                      req.spectral_entropy, req.hjorth_mobility, req.hjorth_complexity]
+            return _tabular_infer(m, values, features, "eeg_epilepsy_combined_gbm.onnx")
+
+        @fast_app.post("/circor/predict")
+        async def circor(req: CircorRequest):
+            m = reg.get("circor")
+            if m is None:
+                raise HTTPException(503, "CirCor não carregado.")
+            features = ["age_months", "weight", "height", "sex", "murmur_locations",
+                        "systolic_murmur_timing", "diastolic_murmur_timing"]
+            values = [req.age_months, req.weight, req.height, req.sex, req.murmur_locations,
+                      req.systolic_murmur_timing, req.diastolic_murmur_timing]
+            return _tabular_infer(m, values, features, "circor_cardiac_gbm.onnx")
+
+        @fast_app.post("/lung/predict")
+        async def lung(req: LungSoundRequest):
+            m = reg.get("lung_sound")
+            if m is None:
+                raise HTTPException(503, "Lung Sound não carregado.")
+            features = ["mfcc_mean", "mfcc_std", "spectral_centroid", "zero_crossing_rate", "rms_energy"]
+            values = [req.mfcc_mean, req.mfcc_std, req.spectral_centroid, req.zero_crossing_rate, req.rms_energy]
+            return _tabular_infer(m, values, features, "lung_sound_ensemble.onnx")
+
+        # ── Imagem — multipart/form-data ─────────────────────────────────────
+
+        @fast_app.post("/image/chest-xray")
+        async def img_chest(image: UploadFile = File(...)):
+            s = reg.get("onnx_chest")
+            if s is None:
+                raise HTTPException(503, "Chest XR não carregado.")
+            return _onnx_infer(s, await image.read(), _ONNX_LABELS["chest_xray"], "chest_xray_efficientnet_b0.pth")
+
+        @fast_app.post("/image/skin")
+        async def img_skin(image: UploadFile = File(...)):
+            s = reg.get("onnx_skin")
+            if s is None:
+                raise HTTPException(503, "Skin não carregado.")
+            return _onnx_infer(s, await image.read(), _ONNX_LABELS["skin"], "skin_efficientnet_b0_gpu.pth")
+
+        @fast_app.post("/image/retinopathy")
+        async def img_retina(image: UploadFile = File(...)):
+            s = reg.get("onnx_retina")
+            if s is None:
+                raise HTTPException(503, "Retinopatia não carregado.")
+            return _onnx_infer(s, await image.read(), _ONNX_LABELS["retinopathy"], "eyepacs_efficientnet_b0.pth")
+
+        @fast_app.post("/image/brain-tumor")
+        async def img_brain(image: UploadFile = File(...)):
+            s = reg.get("onnx_brain")
+            if s is None:
+                raise HTTPException(503, "Brain Tumor não carregado.")
+            return _onnx_infer(s, await image.read(), _ONNX_LABELS["brain_tumor"], "brain_tumor_efficientnet_b0.pth")
+
+        @fast_app.post("/image/fracture")
+        async def img_fracture(image: UploadFile = File(...)):
+            s = reg.get("onnx_fracture")
+            if s is None:
+                raise HTTPException(503, "Fratura não carregado.")
+            return _onnx_infer(s, await image.read(), _ONNX_LABELS["fracture"], "fractura_efficientnet_b0.pth")
+
+        @fast_app.post("/image/glaucoma")
+        async def img_glaucoma(image: UploadFile = File(...)):
+            s = reg.get("onnx_glaucoma")
+            if s is None:
+                raise HTTPException(503, "Glaucoma não carregado.")
+            return _onnx_infer(s, await image.read(), _ONNX_LABELS["glaucoma"], "glaucoma_efficientnet_b0.pth")
+
+        @fast_app.post("/image/mammography")
+        async def img_mammo(image: UploadFile = File(...)):
+            s = reg.get("onnx_mammo")
+            if s is None:
+                raise HTTPException(503, "Mamografia não carregado.")
+            return _onnx_infer(s, await image.read(), _ONNX_LABELS["mammography"], "mamografia_efficientnet_b0.pth")
+
+        return fast_app
