@@ -34,6 +34,9 @@ DRIVE_MODELS = [
     ("eeg_epilepsy_combined_gbm.onnx",  "14NZlNndyoWoQtkaKNQTrO6-Etbopl5Oy"),
     ("circor_cardiac_gbm.onnx",         "1e45tncqP_2wAm9u_M5E07Y2TAasZaKkd"),
     ("lung_sound_ensemble.onnx",        "1kZjWbcNtdT3Tl7l3iXZWKMPNPP79OvA6"),
+    # Brain Tumor v2 ONNX binário (sigmoid) — requer .data file no mesmo diretório
+    # TODO: adicionar Drive ID do arquivo .data quando disponível
+    ("brain_tumor_v2_combined.onnx",   "1g-8rDCroAgSzSKbojwnN6qj9IK0cXSD9"),
     # Imagem — EfficientNet-B0 PTH
     ("skin_efficientnet_b0_gpu.pth",    "1djuI95JgSJt7nJ71mxFJsSLEU_cTljUI"),
     ("eyepacs_efficientnet_b0.pth",     "1Ja7DSuWfck-v397bAPAUHyTS9XlWhqzN"),
@@ -443,6 +446,28 @@ class AldoraAI:
         except Exception as e:
             self._log.warning("%s indisponível: %s", label, e)
 
+    def _load_brain_v2(self) -> None:
+        """Carrega brain_tumor_v2_combined.onnx (binário sigmoid, AUC=0.9995).
+        Requer brain_tumor_v2_combined.onnx.data no mesmo diretório do Volume.
+        Se o .data file estiver ausente, fallback para o PTH 4-classes."""
+        onnx_path = f"{MODEL_DIR}/brain_tumor_v2_combined.onnx"
+        data_path = f"{MODEL_DIR}/brain_tumor_v2_combined.onnx.data"
+        try:
+            import onnxruntime as ort
+            if not os.path.exists(onnx_path):
+                raise FileNotFoundError(f"ONNX ausente: {onnx_path}")
+            if not os.path.exists(data_path):
+                raise FileNotFoundError(
+                    f"Arquivo de pesos externo ausente: {data_path} "
+                    f"(adicionar Drive ID do .data file em DRIVE_MODELS)"
+                )
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            sess = ort.InferenceSession(onnx_path, providers=providers)
+            self.registry["onnx_brain_v2"] = sess
+            self._log.info("Brain Tumor v2 ONNX binário carregado (AUC=0.9995).")
+        except Exception as e:
+            self._log.warning("Brain Tumor v2 indisponível: %s — usando PTH 4-classes.", e)
+
     def _load_pkl(self, key: str, fname: str, label: str, volume_path: bool = True) -> None:
         path = f"{MODEL_DIR}/{fname}" if volume_path else f"/app/models/{fname}"
         try:
@@ -512,7 +537,9 @@ class AldoraAI:
         self._load_pth("onnx_skin",     "skin_efficientnet_b0_gpu.pth",    "Skin EfficientNet-B0")
         self._load_pth("onnx_retina",   "eyepacs_efficientnet_b0.pth",     "EyePACS EfficientNet-B0")
         self._load_pth("onnx_chest",    "chest_xray_efficientnet_b0.pth",  "Chest XR EfficientNet-B0")
-        self._load_pth("onnx_brain",    "brain_tumor_efficientnet_b0.pth", "Brain Tumor EfficientNet-B0")
+        self._load_brain_v2()
+        if "onnx_brain_v2" not in self.registry:
+            self._load_pth("onnx_brain", "brain_tumor_efficientnet_b0.pth", "Brain Tumor EfficientNet-B0")
         self._load_pth("onnx_fracture", "fractura_efficientnet_b0.pth",    "Fratura EfficientNet-B0")
         self._load_pth("onnx_glaucoma", "glaucoma_efficientnet_b0.pth",    "Glaucoma EfficientNet-B0")
         self._load_pth("onnx_mammo",    "mamografia_efficientnet_b0.pth",  "Mamografia EfficientNet-B0")
@@ -851,6 +878,21 @@ class AldoraAI:
 
         @fast_app.post("/image/brain-tumor")
         async def img_brain(image: UploadFile = File(...)):
+            # Preferir v2 (ONNX binário sigmoid, AUC=0.9995) se disponível
+            s_v2 = reg.get("onnx_brain_v2")
+            if s_v2 is not None:
+                img_bytes = await image.read()
+                inp = _preprocess_onnx(img_bytes)
+                out = s_v2.run(None, {s_v2.get_inputs()[0].name: inp})[0][0]
+                raw = float(out) if out.size == 1 else float(out[0])
+                prob = float(1.0 / (1.0 + np.exp(-raw)))
+                label = "anormal" if prob > 0.5 else "normal"
+                conf = round(prob if label == "anormal" else 1.0 - prob, 4)
+                return {"predicao": label, "confianca": conf,
+                        "scores": {"normal": round(1.0 - prob, 4), "anormal": round(prob, 4)},
+                        "modelo_versao": "brain_tumor_v2_combined.onnx",
+                        "disclaimer": DISCLAIMER_SHORT}
+            # Fallback: PTH 4-classes (50% acurácia — aguardando .data file do v2)
             s = reg.get("onnx_brain")
             if s is None:
                 raise HTTPException(503, "Brain Tumor não carregado.")
