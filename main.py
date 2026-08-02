@@ -20,6 +20,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("aldora-ai")
 
 MODEL_REGISTRY: dict = {}
+_PTH_MODEL_CACHE: dict = {}  # lazy-cache para modelos PyTorch carregados sob demanda
 
 DISCLAIMER_CFM = (
     "AVISO REGULATÓRIO — CFM Resolução 2.454/2026: Este resultado é gerado por sistema de apoio diagnóstico "
@@ -65,9 +66,25 @@ def _preprocess_onnx(image_bytes: bytes) -> np.ndarray:
 
 def _onnx_infer(session, image_bytes: bytes, labels: list[str], model_file: str) -> dict:
     inp = _preprocess_onnx(image_bytes)
-    out = session.run(None, {session.get_inputs()[0].name: inp})[0][0]
-    if abs(float(out.sum()) - 1.0) > 0.05:
-        out = _softmax(out)
+
+    if isinstance(session, str):
+        # PTH path — inferência PyTorch com lazy-cache
+        import torch
+        if session not in _PTH_MODEL_CACHE:
+            model = torch.load(session, map_location="cpu", weights_only=False)
+            model.eval()
+            _PTH_MODEL_CACHE[session] = model
+        pth_model = _PTH_MODEL_CACHE[session]
+        t = torch.tensor(inp)
+        with torch.no_grad():
+            logits = pth_model(t)
+            out = torch.softmax(logits, dim=1)[0].cpu().numpy()
+    else:
+        # ONNX InferenceSession
+        out = session.run(None, {session.get_inputs()[0].name: inp})[0][0]
+        if abs(float(out.sum()) - 1.0) > 0.05:
+            out = _softmax(out)
+
     pred_idx = int(out.argmax())
     return {
         "predicao":      labels[pred_idx],
@@ -79,6 +96,38 @@ def _onnx_infer(session, image_bytes: bytes, labels: list[str], model_file: str)
 
 
 def _tabular_infer(model, values: list, features: list[str], model_file: str) -> dict:
+    # BUG 2 FIX: InferenceSession não tem .predict() — usa .run()
+    try:
+        from onnxruntime import InferenceSession as _OrtSession
+        if isinstance(model, _OrtSession):
+            input_name = model.get_inputs()[0].name
+            arr = np.array([values], dtype=np.float32)
+            outputs = model.run(None, {input_name: arr})
+            # XGBoost ONNX: outputs[0]=labels, outputs[1]=probs (dict ou array)
+            if len(outputs) >= 2:
+                proba_raw = outputs[1]
+                if isinstance(proba_raw, list) and proba_raw and isinstance(proba_raw[0], dict):
+                    p1 = float(proba_raw[0].get(1, proba_raw[0].get("1", 0.5)))
+                    p0 = 1.0 - p1
+                elif hasattr(proba_raw, "shape") and len(proba_raw.shape) == 2:
+                    p0, p1 = float(proba_raw[0][0]), float(proba_raw[0][1])
+                else:
+                    p1 = float(outputs[0][0])
+                    p0 = 1.0 - p1
+            else:
+                p1 = float(outputs[0][0])
+                p0 = 1.0 - p1
+            label = "1" if p1 >= 0.5 else "0"
+            return {
+                "predicao":      label,
+                "confianca":     round(max(p0, p1), 4),
+                "scores":        {"0": round(p0, 4), "1": round(p1, 4)},
+                "modelo_versao": model_file,
+                "disclaimer":    DISCLAIMER_SHORT,
+            }
+    except ImportError:
+        pass
+
     import pandas as pd
     X = pd.DataFrame([dict(zip(features, values))])
     if hasattr(model, "predict_proba"):
@@ -216,6 +265,22 @@ def load_models() -> None:
     _load_pth("fractura",      "models/fractura_efficientnet_b0.pth",   "Fratura EfficientNet-B0")
     _load_pth("glaucoma_img",  "models/glaucoma_efficientnet_b0.pth",   "Glaucoma EfficientNet-B0")
     _load_pth("mamografia_img","models/mamografia_efficientnet_b0.pth", "Mamografia EfficientNet-B0")
+
+    # BUG 3 FIX: registrar PTH paths sob as chaves onnx_* esperadas pelos endpoints de imagem
+    _pth_img_map = {
+        "onnx_chest":    "chest_xray14",
+        "onnx_skin":     "skin_img",
+        "onnx_retina":   "eyepacs",
+        "onnx_brain":    "brain_tumor",
+        "onnx_fracture": "fractura",
+        "onnx_glaucoma": "glaucoma_img",
+        "onnx_mammo":    "mamografia_img",
+    }
+    for onnx_key, pth_key in _pth_img_map.items():
+        path = MODEL_REGISTRY.get(pth_key)
+        if path:
+            MODEL_REGISTRY[onnx_key] = path
+            logger.info("Alias %s → %s registrado.", onnx_key, path)
 
 
 @asynccontextmanager
@@ -522,8 +587,18 @@ async def predict_sepsis_endpoint(request: Request):
     """XGBoost Sepse — endpoint direto com JSON livre. Aceita subconjunto das features."""
     try:
         dados = await request.json()
+        # BUG 1 FIX: mapear campos PT-BR → EN (nomes das features do modelo XGBoost)
+        _sepse_map = {
+            'fc': 'HR', 'fr': 'Resp', 'temperatura': 'Temp',
+            'pas': 'SBP', 'pad': 'DBP', 'spo2': 'O2Sat',
+            'lactato': 'Lactate', 'leucocitos': 'WBC',
+            'pcr': 'CRP', 'pct': 'PCT', 'glasgow': 'GCS',
+            'ventilacao_mecanica': 'Mech_Vent', 'vasopressor': 'Vasopressor',
+            'idade': 'Age', 'genero': 'Gender',
+        }
+        dados_en = {_sepse_map.get(k, k): v for k, v in dados.items()}
         from models.sepse_model import predict_sepsis
-        resultado = predict_sepsis(dados)
+        resultado = predict_sepsis(dados_en)
         return {"success": True, "data": resultado}
     except Exception as e:
         logger.exception("Erro /sepsis/predict")
