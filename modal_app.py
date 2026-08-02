@@ -350,6 +350,7 @@ def predict_sepsis_hybrid(dados_en: dict) -> dict:
     volumes={MODEL_DIR: volume},
     image=image,
     timeout=600,
+    secrets=[modal.Secret.from_name("aldora-secrets")],
 )
 class AldoraAI:
 
