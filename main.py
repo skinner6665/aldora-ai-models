@@ -429,6 +429,7 @@ class ReadmissaoRequest(BaseModel):
     lace_score: Optional[float] = 5.0
     previous_admissions: Optional[float] = 0.0
     diagnosis_icd: Optional[float] = 0.0   # codificado
+    acuity: Optional[float] = 1.0          # urgência da internação (0=eletiva, 1=urgência)
 
 
 class DeterioracaoRequest(BaseModel):
@@ -697,9 +698,9 @@ async def readmissao_predict(req: ReadmissaoRequest):
         raise HTTPException(503, "Modelo readmissao_gbm.pkl não carregado. Execute download_models.py.")
     try:
         features = ["age", "length_of_stay", "charlson_index", "lace_score",
-                    "previous_admissions", "diagnosis_icd"]
+                    "previous_admissions", "diagnosis_icd", "acuity"]
         values = [req.age, req.length_of_stay, req.charlson_index, req.lace_score,
-                  req.previous_admissions, req.diagnosis_icd]
+                  req.previous_admissions, req.diagnosis_icd, req.acuity]
         return _tabular_infer(model, values, features, "readmissao_gbm.pkl")
     except Exception as e:
         logger.exception("Erro /readmissao/predict")
