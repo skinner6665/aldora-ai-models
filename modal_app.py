@@ -43,7 +43,7 @@ DRIVE_MODELS = [
     ("brain_tumor_efficientnet_b0.pth", "1KpZgTrJmCCuEFPvMJ1DtJLDm4RPWL6Pd"),
     ("fractura_efficientnet_b0.pth",    "1IINhfX72E3dNTegn-P_rcUDNHAFsUkGj"),
     ("glaucoma_efficientnet_b0.pth",    "18-IrMNiiFn7YYWTsA1AkIwGk5DAOMuBa"),
-    ("mamografia_efficientnet_b0.pth",  "15rJ9FTgElUIaBdwEghEtR6sPdLs9DJyY"),
+    ("mamografia_v5_best.pth",          "1y1AqJV2286JQIeGKaUoqRlIBRbnKjG-L"),
     ("chestxray14_densenet121_v2.pth",  "14Zc7kRQB07JEGe9A6wqDpl92xNKKBq84"),
 ]
 
@@ -98,6 +98,23 @@ _ONNX_LABELS: dict[str, list[str]] = {
     "glaucoma":    ["normal", "glaucoma"],
     "mammography": ["normal", "anormal"],
 }
+
+# ─── TTA — Mamografia V5 (10 augmentações) ───────────────────────────────────
+
+import torchvision.transforms as _T
+
+_MAMOGRAFIA_V5_TTA = [
+    _T.Compose([_T.Resize((224,224)), _T.ToTensor(), _T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])]),
+    _T.Compose([_T.Resize((224,224)), _T.RandomHorizontalFlip(p=1.0), _T.ToTensor(), _T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])]),
+    _T.Compose([_T.Resize((256,256)), _T.CenterCrop(224), _T.ToTensor(), _T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])]),
+    _T.Compose([_T.Resize((224,224)), _T.RandomVerticalFlip(p=1.0), _T.ToTensor(), _T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])]),
+    _T.Compose([_T.Resize((256,256)), _T.CenterCrop(224), _T.RandomHorizontalFlip(p=1.0), _T.ToTensor(), _T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])]),
+    _T.Compose([_T.Resize((240,240)), _T.CenterCrop(224), _T.ToTensor(), _T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])]),
+    _T.Compose([_T.Resize((240,240)), _T.CenterCrop(224), _T.RandomHorizontalFlip(p=1.0), _T.ToTensor(), _T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])]),
+    _T.Compose([_T.Resize((224,224)), _T.RandomRotation(10), _T.ToTensor(), _T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])]),
+    _T.Compose([_T.Resize((256,256)), _T.CenterCrop(224), _T.RandomVerticalFlip(p=1.0), _T.ToTensor(), _T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])]),
+    _T.Compose([_T.Resize((280,280)), _T.CenterCrop(224), _T.ToTensor(), _T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])]),
+]
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -157,6 +174,50 @@ def _onnx_infer(session, image_bytes: bytes, labels: list[str], model_file: str)
         "confianca":     round(float(out[idx]), 4),
         "scores":        {labels[i]: round(float(out[i]), 4) for i in range(len(labels))},
         "modelo_versao": model_file,
+        "disclaimer":    DISCLAIMER_SHORT,
+    }
+
+
+def _mamografia_v5_tta_infer(model_path: str, image_bytes: bytes) -> dict:
+    import torch
+    from PIL import Image
+
+    labels = _ONNX_LABELS["mammography"]
+
+    if model_path not in _PTH_CACHE:
+        checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
+        if isinstance(checkpoint, dict):
+            from torchvision.models import efficientnet_b4
+            model = efficientnet_b4(weights=None)
+            in_f = model.classifier[1].in_features
+            model.classifier[1] = torch.nn.Linear(in_f, len(labels))
+            state = {k.replace("module.", ""): v for k, v in checkpoint.items()}
+            model.load_state_dict(state, strict=False)
+        else:
+            model = checkpoint
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = model.to(device).eval()
+        _PTH_CACHE[model_path] = model
+
+    m = _PTH_CACHE[model_path]
+    device = next(m.parameters()).device
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+    scores = np.zeros(len(labels), dtype=np.float32)
+    with torch.no_grad():
+        for tfm in _MAMOGRAFIA_V5_TTA:
+            t = tfm(img).unsqueeze(0).to(device)
+            out = torch.softmax(m(t), dim=1)[0].cpu().numpy()
+            scores += out
+    scores /= len(_MAMOGRAFIA_V5_TTA)
+
+    idx = int(scores.argmax())
+    return {
+        "predicao":      labels[idx],
+        "confianca":     round(float(scores[idx]), 4),
+        "scores":        {labels[i]: round(float(scores[i]), 4) for i in range(len(labels))},
+        "modelo_versao": "mamografia_v5_best.pth",
+        "tta":           len(_MAMOGRAFIA_V5_TTA),
         "disclaimer":    DISCLAIMER_SHORT,
     }
 
@@ -554,7 +615,7 @@ class AldoraAI:
             self._load_pth("onnx_brain", "brain_tumor_efficientnet_b0.pth", "Brain Tumor EfficientNet-B0")
         self._load_pth("onnx_fracture", "fractura_efficientnet_b0.pth",    "Fratura EfficientNet-B0")
         self._load_pth("onnx_glaucoma", "glaucoma_efficientnet_b0.pth",    "Glaucoma EfficientNet-B0")
-        self._load_pth("onnx_mammo",    "mamografia_efficientnet_b0.pth",  "Mamografia EfficientNet-B0")
+        self._load_pth("mamografia_v5",  "mamografia_v5_best.pth",          "Mamografia V5 EfficientNet-B4 TTA-10")
         self._load_pth("chestxray14",   "chestxray14_densenet121_v2.pth",  "ChestX-ray14 DenseNet-121")
         self._load_onnx_local("onnx_tc_v4",    "tc_cranio_v4_ct.onnx",    "TC Crânio v4 CT",    min_mb=10.0)
         self._load_onnx_local("onnx_mammo_v2", "mamografia_v2_busi.onnx", "Mamografia v2 BUSI", min_mb=10.0)
@@ -928,10 +989,10 @@ class AldoraAI:
 
         @fast_app.post("/image/mammography")
         async def img_mammo(image: UploadFile = File(...)):
-            s = reg.get("onnx_mammo")
+            s = reg.get("mamografia_v5")
             if s is None:
                 raise HTTPException(503, "Mamografia não carregado.")
-            return _onnx_infer(s, await image.read(), _ONNX_LABELS["mammography"], "mamografia_efficientnet_b0.pth")
+            return _mamografia_v5_tta_infer(s, await image.read())
 
         @fast_app.post("/image/tc-cranio-v4")
         async def img_tc_v4(image: UploadFile = File(...)):
