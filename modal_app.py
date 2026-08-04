@@ -96,8 +96,26 @@ _ONNX_LABELS: dict[str, list[str]] = {
     "brain_tumor": ["glioma", "meningioma", "pituitary", "no_tumor"],
     "fracture":    ["normal", "fratura"],
     "glaucoma":    ["normal", "glaucoma"],
-    "mammography": ["normal", "anormal"],
+    "mammography": ["normal", "suspeito"],
 }
+
+try:
+    import torchvision.transforms as _T
+    _norm_mammo = _T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    _MAMOGRAFIA_V5_TTA = [
+        _T.Compose([_T.Resize((224, 224)), _T.ToTensor(), _norm_mammo]),
+        _T.Compose([_T.Resize((224, 224)), _T.RandomHorizontalFlip(p=1.0), _T.ToTensor(), _norm_mammo]),
+        _T.Compose([_T.Resize((256, 256)), _T.CenterCrop(224), _T.ToTensor(), _norm_mammo]),
+        _T.Compose([_T.Resize((224, 224)), _T.RandomVerticalFlip(p=1.0), _T.ToTensor(), _norm_mammo]),
+        _T.Compose([_T.Resize((256, 256)), _T.CenterCrop(224), _T.RandomHorizontalFlip(p=1.0), _T.ToTensor(), _norm_mammo]),
+        _T.Compose([_T.Resize((240, 240)), _T.CenterCrop(224), _T.ToTensor(), _norm_mammo]),
+        _T.Compose([_T.Resize((240, 240)), _T.CenterCrop(224), _T.RandomHorizontalFlip(p=1.0), _T.ToTensor(), _norm_mammo]),
+        _T.Compose([_T.Resize((224, 224)), _T.RandomRotation(10), _T.ToTensor(), _norm_mammo]),
+        _T.Compose([_T.Resize((256, 256)), _T.CenterCrop(224), _T.RandomVerticalFlip(p=1.0), _T.ToTensor(), _norm_mammo]),
+        _T.Compose([_T.Resize((280, 280)), _T.CenterCrop(224), _T.ToTensor(), _norm_mammo]),
+    ]
+except ImportError:
+    _MAMOGRAFIA_V5_TTA = []
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -163,35 +181,21 @@ def _onnx_infer(session, image_bytes: bytes, labels: list[str], model_file: str)
 
 def _mamografia_v5_tta_infer(model_path: str, image_bytes: bytes) -> dict:
     import torch
-    import torchvision.transforms as _T
+    import torch.nn as nn
     from PIL import Image
-
-    labels = _ONNX_LABELS["mammography"]
-    _norm = _T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    _tta = [
-        _T.Compose([_T.Resize((224, 224)), _T.ToTensor(), _norm]),
-        _T.Compose([_T.Resize((224, 224)), _T.RandomHorizontalFlip(p=1.0), _T.ToTensor(), _norm]),
-        _T.Compose([_T.Resize((256, 256)), _T.CenterCrop(224), _T.ToTensor(), _norm]),
-        _T.Compose([_T.Resize((224, 224)), _T.RandomVerticalFlip(p=1.0), _T.ToTensor(), _norm]),
-        _T.Compose([_T.Resize((256, 256)), _T.CenterCrop(224), _T.RandomHorizontalFlip(p=1.0), _T.ToTensor(), _norm]),
-        _T.Compose([_T.Resize((240, 240)), _T.CenterCrop(224), _T.ToTensor(), _norm]),
-        _T.Compose([_T.Resize((240, 240)), _T.CenterCrop(224), _T.RandomHorizontalFlip(p=1.0), _T.ToTensor(), _norm]),
-        _T.Compose([_T.Resize((224, 224)), _T.RandomRotation(10), _T.ToTensor(), _norm]),
-        _T.Compose([_T.Resize((256, 256)), _T.CenterCrop(224), _T.RandomVerticalFlip(p=1.0), _T.ToTensor(), _norm]),
-        _T.Compose([_T.Resize((280, 280)), _T.CenterCrop(224), _T.ToTensor(), _norm]),
-    ]
+    from torchvision import models as tv_models
 
     if model_path not in _PTH_CACHE:
         checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
-        if isinstance(checkpoint, dict):
-            from torchvision.models import efficientnet_b4
-            model = efficientnet_b4(weights=None)
-            in_f = model.classifier[1].in_features
-            model.classifier[1] = torch.nn.Linear(in_f, len(labels))
-            state = {k.replace("module.", ""): v for k, v in checkpoint.items()}
-            model.load_state_dict(state, strict=False)
-        else:
-            model = checkpoint
+        model = tv_models.efficientnet_b4(weights=None)
+        in_f = model.classifier[1].in_features
+        model.classifier = nn.Sequential(
+            nn.Dropout(p=0.4),
+            nn.Linear(in_f, 2),
+        )
+        state = checkpoint if isinstance(checkpoint, dict) else checkpoint.state_dict()
+        state = {k.replace("module.", ""): v for k, v in state.items()}
+        model.load_state_dict(state, strict=False)
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = model.to(device).eval()
         _PTH_CACHE[model_path] = model
@@ -200,22 +204,29 @@ def _mamografia_v5_tta_infer(model_path: str, image_bytes: bytes) -> dict:
     device = next(m.parameters()).device
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    scores = np.zeros(len(labels), dtype=np.float32)
+    tta_probs = []
     with torch.no_grad():
-        for tfm in _tta:
+        for tfm in _MAMOGRAFIA_V5_TTA:
             t = tfm(img).unsqueeze(0).to(device)
-            out = torch.softmax(m(t), dim=1)[0].cpu().numpy()
-            scores += out
-    scores /= len(_tta)
+            prob = torch.softmax(m(t), dim=1)[0, 1].item()
+            tta_probs.append(prob)
 
-    idx = int(scores.argmax())
+    prob_suspeito = float(np.mean(tta_probs))
+    prob_normal   = 1.0 - prob_suspeito
+    label = "suspeito" if prob_suspeito >= 0.5 else "normal"
+
     return {
-        "predicao":      labels[idx],
-        "confianca":     round(float(scores[idx]), 4),
-        "scores":        {labels[i]: round(float(scores[i]), 4) for i in range(len(labels))},
-        "modelo_versao": "mamografia_v5_best.pth",
-        "tta":           len(_tta),
-        "disclaimer":    DISCLAIMER_SHORT,
+        "resultado":       label,
+        "confianca":       round(max(prob_suspeito, prob_normal) * 100, 1),
+        "probabilidades":  {
+            "normal":   round(prob_normal   * 100, 1),
+            "suspeito": round(prob_suspeito * 100, 1),
+        },
+        "tta_transforms":  len(_MAMOGRAFIA_V5_TTA),
+        "auc_validacao":   0.8654,
+        "modelo":          "EfficientNet-B4 TTA-10",
+        "aviso":           DISCLAIMER_CFM,
+        "timestamp":       _ts(),
     }
 
 
@@ -984,11 +995,11 @@ class AldoraAI:
                 raise HTTPException(503, "Glaucoma não carregado.")
             return _onnx_infer(s, await image.read(), _ONNX_LABELS["glaucoma"], "glaucoma_efficientnet_b0.pth")
 
-        @fast_app.post("/image/mammography")
-        async def img_mammo(image: UploadFile = File(...)):
+        @fast_app.post("/image/mamografia-v5")
+        async def img_mammo_v5(image: UploadFile = File(...)):
             s = reg.get("mamografia_v5")
             if s is None:
-                raise HTTPException(503, "Mamografia não carregado.")
+                raise HTTPException(503, "Mamografia V5 não carregado.")
             return _mamografia_v5_tta_infer(s, await image.read())
 
         @fast_app.post("/image/tc-cranio-v4")
