@@ -99,23 +99,6 @@ _ONNX_LABELS: dict[str, list[str]] = {
     "mammography": ["normal", "anormal"],
 }
 
-# ─── TTA — Mamografia V5 (10 augmentações) ───────────────────────────────────
-
-import torchvision.transforms as _T
-
-_MAMOGRAFIA_V5_TTA = [
-    _T.Compose([_T.Resize((224,224)), _T.ToTensor(), _T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])]),
-    _T.Compose([_T.Resize((224,224)), _T.RandomHorizontalFlip(p=1.0), _T.ToTensor(), _T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])]),
-    _T.Compose([_T.Resize((256,256)), _T.CenterCrop(224), _T.ToTensor(), _T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])]),
-    _T.Compose([_T.Resize((224,224)), _T.RandomVerticalFlip(p=1.0), _T.ToTensor(), _T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])]),
-    _T.Compose([_T.Resize((256,256)), _T.CenterCrop(224), _T.RandomHorizontalFlip(p=1.0), _T.ToTensor(), _T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])]),
-    _T.Compose([_T.Resize((240,240)), _T.CenterCrop(224), _T.ToTensor(), _T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])]),
-    _T.Compose([_T.Resize((240,240)), _T.CenterCrop(224), _T.RandomHorizontalFlip(p=1.0), _T.ToTensor(), _T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])]),
-    _T.Compose([_T.Resize((224,224)), _T.RandomRotation(10), _T.ToTensor(), _T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])]),
-    _T.Compose([_T.Resize((256,256)), _T.CenterCrop(224), _T.RandomVerticalFlip(p=1.0), _T.ToTensor(), _T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])]),
-    _T.Compose([_T.Resize((280,280)), _T.CenterCrop(224), _T.ToTensor(), _T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])]),
-]
-
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _ts() -> str:
@@ -180,9 +163,23 @@ def _onnx_infer(session, image_bytes: bytes, labels: list[str], model_file: str)
 
 def _mamografia_v5_tta_infer(model_path: str, image_bytes: bytes) -> dict:
     import torch
+    import torchvision.transforms as _T
     from PIL import Image
 
     labels = _ONNX_LABELS["mammography"]
+    _norm = _T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    _tta = [
+        _T.Compose([_T.Resize((224, 224)), _T.ToTensor(), _norm]),
+        _T.Compose([_T.Resize((224, 224)), _T.RandomHorizontalFlip(p=1.0), _T.ToTensor(), _norm]),
+        _T.Compose([_T.Resize((256, 256)), _T.CenterCrop(224), _T.ToTensor(), _norm]),
+        _T.Compose([_T.Resize((224, 224)), _T.RandomVerticalFlip(p=1.0), _T.ToTensor(), _norm]),
+        _T.Compose([_T.Resize((256, 256)), _T.CenterCrop(224), _T.RandomHorizontalFlip(p=1.0), _T.ToTensor(), _norm]),
+        _T.Compose([_T.Resize((240, 240)), _T.CenterCrop(224), _T.ToTensor(), _norm]),
+        _T.Compose([_T.Resize((240, 240)), _T.CenterCrop(224), _T.RandomHorizontalFlip(p=1.0), _T.ToTensor(), _norm]),
+        _T.Compose([_T.Resize((224, 224)), _T.RandomRotation(10), _T.ToTensor(), _norm]),
+        _T.Compose([_T.Resize((256, 256)), _T.CenterCrop(224), _T.RandomVerticalFlip(p=1.0), _T.ToTensor(), _norm]),
+        _T.Compose([_T.Resize((280, 280)), _T.CenterCrop(224), _T.ToTensor(), _norm]),
+    ]
 
     if model_path not in _PTH_CACHE:
         checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
@@ -205,11 +202,11 @@ def _mamografia_v5_tta_infer(model_path: str, image_bytes: bytes) -> dict:
 
     scores = np.zeros(len(labels), dtype=np.float32)
     with torch.no_grad():
-        for tfm in _MAMOGRAFIA_V5_TTA:
+        for tfm in _tta:
             t = tfm(img).unsqueeze(0).to(device)
             out = torch.softmax(m(t), dim=1)[0].cpu().numpy()
             scores += out
-    scores /= len(_MAMOGRAFIA_V5_TTA)
+    scores /= len(_tta)
 
     idx = int(scores.argmax())
     return {
@@ -217,7 +214,7 @@ def _mamografia_v5_tta_infer(model_path: str, image_bytes: bytes) -> dict:
         "confianca":     round(float(scores[idx]), 4),
         "scores":        {labels[i]: round(float(scores[i]), 4) for i in range(len(labels))},
         "modelo_versao": "mamografia_v5_best.pth",
-        "tta":           len(_MAMOGRAFIA_V5_TTA),
+        "tta":           len(_tta),
         "disclaimer":    DISCLAIMER_SHORT,
     }
 
