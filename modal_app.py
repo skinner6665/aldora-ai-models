@@ -27,7 +27,8 @@ DRIVE_MODELS = [
     # Tabular PKL/ONNX (não presentes localmente)
     ("cardiac_xgboost_v2_combined.pkl", "1BrbaUR-c0mJl8n3flJA-o7VE497Hengl"),
     ("risco_materno_gbm.onnx",          "10WAr9OoV_HNSvGEMoeXjJvwK108BIjWa"),
-    ("mortality_gbm.onnx",              "1gUz8rXIhHK3M001_wcISCqtTAPjDMHEl"),
+    ("mortality_xgb_v2.json",         "1-jrXeNuxirJLXj3lHhrFC0dJPeTsupUv"),
+    ("mortality_xgb_v2_colunas.json", "1KpfN0dinRDJQ95CkOz3Mwpd-XB-HHMG5"),
     ("readmissao_gbm.onnx",             "1CjHBGeCm44LanRMUCWWi7kT2oNYmquqC"),
     ("deterioracao_gbm.onnx",           "1CMg9igOO1Lg0d-_C-hjNeFXGN9idSgcT"),
     ("vitaldb_ihi_v2.onnx",             "1rp03ROSuaOzQSuckVwojq-5pJqoHGDMG"),
@@ -568,6 +569,27 @@ class AldoraAI:
         except Exception as e:
             self._log.warning("%s indisponível: %s", label, e)
 
+    def _load_xgb_native(self, key: str, model_fname: str, cols_fname: str, label: str, auc: float, n: int) -> None:
+        """Carrega booster XGBoost nativo (JSON) e lista de colunas."""
+        model_path = f"{MODEL_DIR}/{model_fname}"
+        cols_path = f"{MODEL_DIR}/{cols_fname}"
+        try:
+            import xgboost as xgb
+            import json
+            if not os.path.exists(model_path) or not os.path.exists(cols_path):
+                raise FileNotFoundError(f"arquivos ausentes: {model_path} ou {cols_path}")
+            b = xgb.Booster()
+            b.load_model(model_path)
+            with open(cols_path, "r") as f:
+                contrato = json.load(f)
+            colunas = contrato["colunas"]
+            if len(colunas) != contrato.get("n", len(colunas)):
+                raise ValueError(f"contrato inconsistente: {len(colunas)} colunas, n={contrato.get('n')}")
+            self.registry[key] = {"booster": b, "colunas": colunas, "auc": auc, "n": n}
+            self._log.info("%s carregado (%d colunas, AUC %.4f).", label, len(colunas), auc)
+        except Exception as e:
+            self._log.warning("%s indisponível: %s", label, e)
+
     def _load_all_models(self) -> None:
         self.registry: dict = {}
 
@@ -614,7 +636,7 @@ class AldoraAI:
         # Tabular — Drive → Volume
         self._load_pkl("cardiac",       "cardiac_xgboost_v2_combined.pkl", "Cardiac XGBoost v2")
         self._load_onnx("risco_materno", "risco_materno_gbm.onnx",         "Risco Materno GBM")
-        self._load_onnx("mortality",    "mortality_gbm.onnx",               "Mortality GBM")
+        self._load_xgb_native("mortality", "mortality_xgb_v2.json", "mortality_xgb_v2_colunas.json", "Mortality XGBoost v2", 0.8961, 264)
         self._load_onnx("readmissao",   "readmissao_gbm.onnx",              "Readmissão GBM")
         self._load_onnx("deterioracao", "deterioracao_gbm.onnx",            "Deterioração GBM")
         self._load_onnx("vitaldb",      "vitaldb_ihi_v2.onnx",              "VitalDB IHI v2")
@@ -699,11 +721,7 @@ class AldoraAI:
             heart_rate: float | None = None
 
         class MortalityRequest(BaseModel):
-            age: float | None = 50.0; sofa_score: float | None = 0.0
-            apache_ii: float | None = 0.0; gcs: float | None = 15.0
-            lactate: float | None = 1.0; creatinine: float | None = 0.8
-            bilirubin: float | None = 0.5; platelets: float | None = 250.0
-            pao2_fio2: float | None = 400.0; vasopressors: float | None = 0.0
+            valores: dict[str, float | None] = {}
 
         class ReadmissaoRequest(BaseModel):
             age: float | None = 50.0; length_of_stay: float | None = 5.0
@@ -889,16 +907,83 @@ class AldoraAI:
             values = [req.age, req.systolic_bp, req.diastolic_bp, bs_mmol, body_temp_f, req.heart_rate]
             return _tabular_infer(m, values, features, "risco_materno_gbm.onnx")
 
+        # Retreinado na Sessão 67 com a versão COMPLETA do WiDS Datathon 2020
+        # (186 colunas) — o modelo anterior usava a versão reduzida de 85 colunas,
+        # SEM nenhuma laboratorial; AUC 0.8961 contra 0.8886; XGBoost em GPU,
+        # 2,6 segundos de treino; 106 colunas (features + indicadores __medido
+        # de ausencia); booster CORTADO em 264 árvores (best_iteration+1) —
+        # sem o corte, predict usaria 304 e divergiria 0,069 em silêncio;
+        # aceita NaN nativamente, NÃO imputar; recall 0.74 no óbito com
+        # precisão 0.34, o scale_pos_weight deslocou para sensibilidade;
+        # notebook e dossiê em ALDORA HEALTH/dossiê_treinamento/.
         @fast_app.post("/mortality/predict")
         async def mortality(req: MortalityRequest):
+            import numpy as np
+            import xgboost as xgb
+
             m = reg.get("mortality")
             if m is None:
-                raise HTTPException(503, "Mortality GBM não carregado.")
-            features = ["age", "sofa_score", "apache_ii", "gcs", "lactate",
-                        "creatinine", "bilirubin", "platelets", "pao2_fio2", "vasopressors"]
-            values = [req.age, req.sofa_score, req.apache_ii, req.gcs, req.lactate,
-                      req.creatinine, req.bilirubin, req.platelets, req.pao2_fio2, req.vasopressors]
-            return _tabular_infer(m, values, features, "mortality_gbm.onnx")
+                raise HTTPException(503, "Mortality XGBoost v2 não carregado.")
+
+            if not req.valores:
+                raise HTTPException(400, "Dicionário 'valores' vazio — fornecer ao menos uma feature.")
+
+            colunas = m["colunas"]
+            desconhecidas = [k for k in req.valores if k not in colunas]
+            if desconhecidas:
+                raise HTTPException(400, f"Chaves desconhecidas: {', '.join(desconhecidas)}")
+
+            valores_ordenados = []
+            features_ausentes = []
+            features_utilizadas = 0
+
+            for col in colunas:
+                val = req.valores.get(col)
+                if val is None:
+                    valores_ordenados.append(float('nan'))
+                    features_ausentes.append(col)
+                else:
+                    valores_ordenados.append(float(val))
+                    features_utilizadas += 1
+
+            arr = np.array([valores_ordenados], dtype=np.float32)
+            probabilidade = float(m["booster"].predict(xgb.DMatrix(arr))[0])
+            score = int(probabilidade * 100)
+
+            # Faixas de triagem baseadas na mortalidade de 8,63% do dataset
+            if probabilidade < 0.10:
+                risco = "baixo"
+                cor = "verde"
+                mensagem = "Risco baixo de mortalidade."
+            elif probabilidade < 0.25:
+                risco = "moderado"
+                cor = "amarelo"
+                mensagem = "Risco moderado — monitorar evolução."
+            elif probabilidade < 0.50:
+                risco = "alto"
+                cor = "laranja"
+                mensagem = "Risco alto — avaliação clínica urgente recomendada."
+            else:
+                risco = "critico"
+                cor = "vermelho"
+                mensagem = "Risco crítico — intervenção imediata considerada."
+
+            return {
+                "success": True,
+                "data": {
+                    "score": score,
+                    "probabilidade": probabilidade,
+                    "risco": risco,
+                    "cor": cor,
+                    "mensagem": mensagem,
+                    "features_utilizadas": features_utilizadas,
+                    "features_ausentes": features_ausentes,
+                    "auc_modelo": 0.8961,
+                    "versao_modelo": "mortality_xgb_v2.json",
+                    "dataset_treino": "WiDS Datathon 2020 (MIT GOSSIS)",
+                    "disclaimer": "Conforme CFM 2.454/2026: esta é uma ferramenta de apoio à decisão clínica e não substitui avaliação médica presencial."
+                }
+            }
 
         @fast_app.post("/readmissao/predict")
         async def readmissao(req: ReadmissaoRequest):
