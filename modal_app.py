@@ -234,6 +234,14 @@ def _tabular_infer(model, values: list, features: list[str], model_file: str) ->
     try:
         from onnxruntime import InferenceSession as _OrtSession
         if isinstance(model, _OrtSession):
+            expected_shape = model.get_inputs()[0].shape
+            if len(expected_shape) > 1 and isinstance(expected_shape[1], int):
+                if expected_shape[1] != len(values):
+                    from fastapi import HTTPException
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Shape mismatch for {model_file}: model expects {expected_shape[1]} features, got {len(values)}"
+                    )
             arr = np.array([values], dtype=np.float32)
             outputs = model.run(None, {model.get_inputs()[0].name: arr})
             if len(outputs) >= 2:
@@ -683,12 +691,12 @@ class AldoraAI:
             campaign: float | None = 1.0
 
         class PreeclampsiaRequest(BaseModel):
-            age: float | None = 25.0; bmi: float | None = 22.0
-            systolic_bp: float | None = 120.0; diastolic_bp: float | None = 80.0
-            mean_arterial_pressure: float | None = 93.0; proteinuria: float | None = 0.0
-            creatinine: float | None = 0.8; platelets: float | None = 250.0
-            alt: float | None = 20.0; ast: float | None = 20.0
-            gestational_age: float | None = 28.0
+            age: float | None = None
+            systolic_bp: float | None = None
+            diastolic_bp: float | None = None
+            blood_sugar_mgdl: float | None = None
+            body_temp_celsius: float | None = None
+            heart_rate: float | None = None
 
         class MortalityRequest(BaseModel):
             age: float | None = 50.0; sofa_score: float | None = 0.0
@@ -850,15 +858,33 @@ class AldoraAI:
             values = [req.murmur_presence, req.age_years, req.sex, req.pregnancy_status, req.campaign]
             return _tabular_infer(m, values, features, "cardiac_xgboost_v2_combined.pkl")
 
+        # 6 features do treino da Sessão 13; AUC 0.9865;
+        # GradientBoostingClassifier n_estimators=300 max_depth=5
+        # learning_rate=0.05 random_state=42; datasets Maternal Health Risk Data
+        # combinados; alvo BINÁRIO RiskLevel==2 (alto risco materno) —
+        # o modelo NÃO prediz pré-eclâmpsia especificamente, apesar do nome
+        # do arquivo; StandardScaler embutido no ONNX desde a Sessão 18.
         @fast_app.post("/preeclampsia/predict")
         async def preeclampsia(req: PreeclampsiaRequest):
             m = reg.get("preeclampsia")
             if m is None:
                 raise HTTPException(503, "Preeclampsia GBM não carregado.")
-            features = ["age", "bmi", "systolic_bp", "diastolic_bp", "mean_arterial_pressure",
-                        "proteinuria", "creatinine", "platelets", "alt", "ast", "gestational_age"]
-            values = [req.age, req.bmi, req.systolic_bp, req.diastolic_bp, req.mean_arterial_pressure,
-                      req.proteinuria, req.creatinine, req.platelets, req.alt, req.ast, req.gestational_age]
+            missing = [
+                name for name, val in [
+                    ("age", req.age),
+                    ("systolic_bp", req.systolic_bp),
+                    ("diastolic_bp", req.diastolic_bp),
+                    ("blood_sugar_mgdl", req.blood_sugar_mgdl),
+                    ("body_temp_celsius", req.body_temp_celsius),
+                    ("heart_rate", req.heart_rate),
+                ] if val is None
+            ]
+            if missing:
+                raise HTTPException(400, f"Campos ausentes: {', '.join(missing)}")
+            body_temp_f = req.body_temp_celsius * 9.0 / 5.0 + 32.0
+            bs_mmol = req.blood_sugar_mgdl / 18.0
+            features = ["Age", "SystolicBP", "DiastolicBP", "BS", "BodyTemp", "HeartRate"]
+            values = [req.age, req.systolic_bp, req.diastolic_bp, bs_mmol, body_temp_f, req.heart_rate]
             return _tabular_infer(m, values, features, "preeclampsia_gbm.onnx")
 
         @fast_app.post("/mortality/predict")
