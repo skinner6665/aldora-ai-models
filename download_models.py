@@ -13,7 +13,7 @@ MODELS = [
     ("models/ecg_lgbm_ptbxl.pkl",             "1ZqFavjvVsclQDP2yCep_1qb6MRXV_Pzr"),
     ("models/ecg_label_encoder.pkl",          "1h5y3wfw8HxazI6T4SLwJwfqXP8As8YtW"),
     ("models/cardiac_xgboost_v2_combined.pkl","1BrbaUR-c0mJl8n3flJA-o7VE497Hengl"),
-    ("models/preeclampsia_gbm.onnx",          "1hDiCSvuoa6dXdEWazr4R0zkINlOS6Gh1"),
+    ("models/risco_materno_gbm.onnx",         "10WAr9OoV_HNSvGEMoeXjJvwK108BIjWa"),
     ("models/mortality_gbm.onnx",             "1gUz8rXIhHK3M001_wcISCqtTAPjDMHEl"),
     ("models/readmissao_gbm.onnx",            "1CjHBGeCm44LanRMUCWWi7kT2oNYmquqC"),
     ("models/deterioracao_gbm.onnx",          "1CMg9igOO1Lg0d-_C-hjNeFXGN9idSgcT"),

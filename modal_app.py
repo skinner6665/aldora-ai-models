@@ -26,7 +26,7 @@ volume = modal.Volume.from_name("aldora-models-v1", create_if_missing=True)
 DRIVE_MODELS = [
     # Tabular PKL/ONNX (não presentes localmente)
     ("cardiac_xgboost_v2_combined.pkl", "1BrbaUR-c0mJl8n3flJA-o7VE497Hengl"),
-    ("preeclampsia_gbm.onnx",           "1hDiCSvuoa6dXdEWazr4R0zkINlOS6Gh1"),
+    ("risco_materno_gbm.onnx",          "10WAr9OoV_HNSvGEMoeXjJvwK108BIjWa"),
     ("mortality_gbm.onnx",              "1gUz8rXIhHK3M001_wcISCqtTAPjDMHEl"),
     ("readmissao_gbm.onnx",             "1CjHBGeCm44LanRMUCWWi7kT2oNYmquqC"),
     ("deterioracao_gbm.onnx",           "1CMg9igOO1Lg0d-_C-hjNeFXGN9idSgcT"),
@@ -613,7 +613,7 @@ class AldoraAI:
 
         # Tabular — Drive → Volume
         self._load_pkl("cardiac",       "cardiac_xgboost_v2_combined.pkl", "Cardiac XGBoost v2")
-        self._load_onnx("preeclampsia", "preeclampsia_gbm.onnx",           "Preeclampsia GBM")
+        self._load_onnx("risco_materno", "risco_materno_gbm.onnx",         "Risco Materno GBM")
         self._load_onnx("mortality",    "mortality_gbm.onnx",               "Mortality GBM")
         self._load_onnx("readmissao",   "readmissao_gbm.onnx",              "Readmissão GBM")
         self._load_onnx("deterioracao", "deterioracao_gbm.onnx",            "Deterioração GBM")
@@ -690,7 +690,7 @@ class AldoraAI:
             sex: float | None = 0.0; pregnancy_status: float | None = 0.0
             campaign: float | None = 1.0
 
-        class PreeclampsiaRequest(BaseModel):
+        class RiscoMaternoRequest(BaseModel):
             age: float | None = None
             systolic_bp: float | None = None
             diastolic_bp: float | None = None
@@ -858,17 +858,19 @@ class AldoraAI:
             values = [req.murmur_presence, req.age_years, req.sex, req.pregnancy_status, req.campaign]
             return _tabular_infer(m, values, features, "cardiac_xgboost_v2_combined.pkl")
 
-        # 6 features do treino da Sessão 13; AUC 0.9865;
-        # GradientBoostingClassifier n_estimators=300 max_depth=5
-        # learning_rate=0.05 random_state=42; datasets Maternal Health Risk Data
-        # combinados; alvo BINÁRIO RiskLevel==2 (alto risco materno) —
-        # o modelo NÃO prediz pré-eclâmpsia especificamente, apesar do nome
-        # do arquivo; StandardScaler embutido no ONNX desde a Sessão 18.
-        @fast_app.post("/preeclampsia/predict")
-        async def preeclampsia(req: PreeclampsiaRequest):
-            m = reg.get("preeclampsia")
+        # Retreinado na Sessão 67; AUC 0.9265; GradientBoostingClassifier
+        # n_estimators=300 max_depth=5 learning_rate=0.05 random_state=42;
+        # 452 linhas após deduplicação dos datasets Maternal Health Risk;
+        # alvo binário RiskLevel==2 (risco materno ALTO); NÃO prediz
+        # pré-eclâmpsia — falta proteinúria e idade gestacional no dataset;
+        # StandardScaler embutido no grafo ONNX; notebook e dossiê em
+        # ALDORA HEALTH/dossiê_treinamento/; substitui preeclampsia_gbm.onnx,
+        # que decidia por glicemia e errava hipertensão grave.
+        @fast_app.post("/risco-materno/predict")
+        async def risco_materno(req: RiscoMaternoRequest):
+            m = reg.get("risco_materno")
             if m is None:
-                raise HTTPException(503, "Preeclampsia GBM não carregado.")
+                raise HTTPException(503, "Risco Materno GBM não carregado.")
             missing = [
                 name for name, val in [
                     ("age", req.age),
@@ -885,7 +887,7 @@ class AldoraAI:
             bs_mmol = req.blood_sugar_mgdl / 18.0
             features = ["Age", "SystolicBP", "DiastolicBP", "BS", "BodyTemp", "HeartRate"]
             values = [req.age, req.systolic_bp, req.diastolic_bp, bs_mmol, body_temp_f, req.heart_rate]
-            return _tabular_infer(m, values, features, "preeclampsia_gbm.onnx")
+            return _tabular_infer(m, values, features, "risco_materno_gbm.onnx")
 
         @fast_app.post("/mortality/predict")
         async def mortality(req: MortalityRequest):
