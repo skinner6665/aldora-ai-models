@@ -655,8 +655,8 @@ class AldoraAI:
         self._load_pth("onnx_glaucoma", "glaucoma_efficientnet_b0.pth",    "Glaucoma EfficientNet-B0")
         self._load_pth("mamografia_v5",  "mamografia_v5_best.pth",          "Mamografia V5 EfficientNet-B4 TTA-10")
         self._load_pth("chestxray14",   "chestxray14_densenet121_v2.pth",  "ChestX-ray14 DenseNet-121")
-        self._load_onnx_local("onnx_tc_v4",    "tc_cranio_v4_ct.onnx",    "TC Crânio v4 CT",    min_mb=10.0)
-        self._load_onnx_local("onnx_mammo_v2", "mamografia_v2_busi.onnx", "Mamografia v2 BUSI", min_mb=10.0)
+        self._load_onnx("onnx_tc_v4",    "tc_cranio_v4_ct.onnx",    "TC Crânio v4 CT")
+        self._load_onnx("onnx_mammo_v2", "mamografia_v2_busi.onnx", "Mamografia v2 BUSI")
 
     # ── FastAPI ASGI App ────────────────────────────────────────────────────
 

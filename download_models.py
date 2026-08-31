@@ -22,6 +22,9 @@ MODELS = [
     ("models/eeg_epilepsy_combined_gbm.onnx", "14NZlNndyoWoQtkaKNQTrO6-Etbopl5Oy"),
     ("models/circor_cardiac_gbm.onnx",        "1e45tncqP_2wAm9u_M5E07Y2TAasZaKkd"),
     ("models/lung_sound_ensemble.onnx",       "1kZjWbcNtdT3Tl7l3iXZWKMPNPP79OvA6"),
+    ("models/tc_cranio_v4_ct.onnx",           "1fLbsYf8wRH3enpMRDbaiqfEef6uohWZw"),
+    ("models/mamografia_v2_busi.onnx",        "1eeVIgjQHp9znLONF16d3G0-Sd856F6ed"),
+    ("models/brain_tumor_v2_combined.onnx",   "1g-8rDCroAgSzSKbojwnN6qj9IK0cXSD9"),
     # ── Imagem — EfficientNet-B0 PTH ──────────────────────────────────────
     ("models/skin_efficientnet_b0_gpu.pth",   "1djuI95JgSJt7nJ71mxFJsSLEU_cTljUI"),
     ("models/skin_label_encoder_gpu.pkl",     "1VqRx9AXBtQ95DhqBqn5yFzzi0XTenmqN"),
