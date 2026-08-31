@@ -81,11 +81,18 @@ def load_derma() -> DermaModel:
     # Backbone ImageNet pretrained; head adaptado para 7 classes
     model = timm.create_model("efficientnet_b4", pretrained=True, num_classes=7)
 
-    # Carrega pesos fine-tuned se disponível
+    # Carrega pesos fine-tuned; falha explícita se ausente
     weights_path = os.environ.get("DERMA_WEIGHTS_PATH", MODEL_WEIGHTS_PATH)
-    if os.path.exists(weights_path):
-        state = torch.load(weights_path, map_location="cpu", weights_only=True)
-        model.load_state_dict(state)
+    if not os.path.exists(weights_path):
+        raise FileNotFoundError(
+            f"pesos do derma ausentes em {weights_path}. O modelo NAO esta "
+            "treinado: a cabeca de 7 classes seria aleatoria e o endpoint "
+            "devolveria melanoma e carcinoma a partir de ruido. Medido na "
+            "AHS-71: delta 0,2011 entre conteineres. Enquanto o .pth nao "
+            "existir, /v1/derma deve retornar 503."
+        )
+    state = torch.load(weights_path, map_location="cpu", weights_only=True)
+    model.load_state_dict(state)
 
     model.eval()
 
