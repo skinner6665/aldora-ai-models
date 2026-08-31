@@ -37,6 +37,8 @@ DRIVE_MODELS = [
     ("lung_sound_ensemble.onnx",        "1kZjWbcNtdT3Tl7l3iXZWKMPNPP79OvA6"),
     # Brain Tumor v2 ONNX binário sigmoid — pesos embutidos (16.5MB, AUC=0.9995)
     ("brain_tumor_v2_combined.onnx",   "1g-8rDCroAgSzSKbojwnN6qj9IK0cXSD9"),
+    ("tc_cranio_v4_ct.onnx",           "1fLbsYf8wRH3enpMRDbaiqfEef6uohWZw"),
+    ("mamografia_v2_busi.onnx",        "1eeVIgjQHp9znLONF16d3G0-Sd856F6ed"),
     # Imagem — EfficientNet-B0 PTH
     ("skin_efficientnet_b0_gpu.pth",    "1djuI95JgSJt7nJ71mxFJsSLEU_cTljUI"),
     ("eyepacs_efficientnet_b0.pth",     "1Ja7DSuWfck-v397bAPAUHyTS9XlWhqzN"),
