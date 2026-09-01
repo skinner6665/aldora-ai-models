@@ -48,6 +48,13 @@ DRIVE_MODELS = [
     ("glaucoma_efficientnet_b0.pth",    "18-IrMNiiFn7YYWTsA1AkIwGk5DAOMuBa"),
     ("mamografia_v5_best.pth",          "1y1AqJV2286JQIeGKaUoqRlIBRbnKjG-L"),
     ("chestxray14_densenet121_v2.pth",  "14Zc7kRQB07JEGe9A6wqDpl92xNKKBq84"),
+    # ECG CODE-15% (Fase B) — Pesos PyTorch (ResNet1D)
+    # IDs confirmados via links do Drive fornecidos pelo usuário
+    ("code15_faseB18_fold0.pt",         "1CK0WZTegzEPQEeukJ4u2US07_-Y3unFa"),
+    ("code15_faseB18_fold1.pt",         "1toiMk9bUY_oCuiLynk3WGSRE7dw-Sj9c"),
+    ("code15_faseB18_fold2.pt",         "1r7z90NDSkSacbJqmv3RASGHMTaJ0rilD"),
+    ("code15_faseB18_fold3.pt",         "1HPvIu8WOcUXeGXEcAPXXqk9lAGSzWUDS"),
+    ("code15_faseB18_fold4.pt",         "1yBV2tZzRbroYA7jc4mNaXKGv0l8NRgzE"),
 ]
 
 image = (
@@ -603,13 +610,25 @@ class AldoraAI:
         except Exception as e:
             self._log.warning("CheXpert indisponível: %s", e)
 
-        # ECG — rule-based + LightGBM PTB-XL
+        # ECG — rule-based + LightGBM PTB-XL (Legado)
         try:
             from models.ecg_model import load_ecg
             self.registry["ecg"] = load_ecg()
             self._log.info("ECG LightGBM PTB-XL carregado.")
         except Exception as e:
             self._log.warning("ECG indisponível: %s", e)
+
+        # ECG — CODE-15% (Novo, Brasileiro, ResNet1D Ensemble)
+        try:
+            from models.ecg_code15 import load_ecg_code15
+            predictor = load_ecg_code15()
+            if predictor.loaded:
+                self.registry["ecg_code15"] = predictor
+                self._log.info("ECG CODE-15% carregado (%d folds).", len(predictor.models))
+            else:
+                self._log.warning("ECG CODE-15% não carregado (pesos ausentes?).")
+        except Exception as e:
+            self._log.warning("ECG CODE-15% indisponível: %s", e)
 
         # Derma — EfficientNet-B4 HAM10000
         try:
@@ -800,6 +819,36 @@ class AldoraAI:
             return {"resultado": resultado,
                     "confianca": round(achados[0]["probabilidade"], 4) if achados else 0.0,
                     "modelo": "rule-based-ecg-v1", "aviso": DISCLAIMER_CFM, "timestamp": _ts()}
+
+        @fast_app.post("/v1/ecg-code")
+        async def ecg_code(req: ECGSignalsRequest):
+            """Endpoint para o modelo CODE-15% (Brasileiro, ResNet1D).
+            Requer sinais brutos de 12 derivações. Se receber 100Hz, faz upsampling para 500Hz."""
+            m = reg.get("ecg_code15")
+            if m is None:
+                raise HTTPException(503, "ECG CODE-15% não carregado. Verifique se os pesos foram baixados do Drive.")
+
+            import numpy as np
+            from scipy import signal as scipy_signal
+
+            signals = np.array(req.leads_100hz, dtype=np.float32)
+
+            # Validação básica de shape
+            if signals.shape[0] != 12:
+                raise HTTPException(400, f"Esperado 12 derivações, recebido {signals.shape[0]}.")
+
+            # Upsampling de 100Hz para 500Hz se necessário (heurística: se duração for ~10s a 100Hz = 1000 pontos)
+            # O CODE-15% espera 5000 pontos (10s @ 500Hz).
+            if signals.shape[1] < 2000:  # Provavelmente 100Hz ou menos
+                # Upsample por fator de 5 (100 -> 500)
+                signals = scipy_signal.resample(signals, 5000, axis=1)
+            elif signals.shape[1] != 5000:
+                # Se não for exatamente 5000, resample para 5000
+                signals = scipy_signal.resample(signals, 5000, axis=1)
+
+            resultado = m.predict(signals)
+            resultado["timestamp"] = _ts()
+            return {"resultado": resultado, "aviso": DISCLAIMER_CFM}
 
         @fast_app.post("/ecg/analyze-signals")
         async def ecg_signals(req: ECGSignalsRequest):
