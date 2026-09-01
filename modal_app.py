@@ -716,6 +716,16 @@ class AldoraAI:
             qrs_ms: float | None = 0.0; qtc_ms: float | None = 0.0
             rr_variability: float | None = 0.0; paciente_id: str | None = None
 
+        class ECGCode15Request(BaseModel):
+            """Sinal bruto para o CODE-15%. Schema próprio: o legado
+            /ecg/analyze-signals usa ECGSignalsRequest e de fato espera
+            100 Hz, onde o nome leads_100hz está correto.
+            Aqui o modelo é 400 Hz nativo e NÃO reamostra, então a taxa é
+            declarada e obrigatória — sem default, para não falhar aberto."""
+            leads: list[list[float]]
+            sr: float
+            paciente_id: str | None = None
+
         class SepseRequest(BaseModel):
             hr: float | None = None; o2sat: float | None = None
             temp: float | None = None; sbp: float | None = None
@@ -821,32 +831,30 @@ class AldoraAI:
                     "modelo": "rule-based-ecg-v1", "aviso": DISCLAIMER_CFM, "timestamp": _ts()}
 
         @fast_app.post("/v1/ecg-code")
-        async def ecg_code(req: ECGSignalsRequest):
+        async def ecg_code(req: ECGCode15Request):
             """Endpoint para o modelo CODE-15% (Brasileiro, ResNet1D).
-            Requer sinais brutos de 12 derivações. Se receber 100Hz, faz upsampling para 500Hz."""
+            Sinal bruto de 12 derivações a 400 Hz NATIVO. Não reamostra:
+            taxa diferente de 400 Hz é rejeitada com HTTP 400. Reamostrar
+            em silêncio deslocaria a base de tempo e corromperia justamente
+            1dAVb (intervalo PR) e SB/ST (frequência)."""
             m = reg.get("ecg_code15")
             if m is None:
                 raise HTTPException(503, "ECG CODE-15% não carregado. Verifique se os pesos foram baixados do Drive.")
 
             import numpy as np
-            from scipy import signal as scipy_signal
 
-            signals = np.array(req.leads_100hz, dtype=np.float32)
+            signals = np.array(req.leads, dtype=np.float32)
 
             # Validação básica de shape
-            if signals.shape[0] != 12:
-                raise HTTPException(400, f"Esperado 12 derivações, recebido {signals.shape[0]}.")
+            if signals.ndim != 2 or signals.shape[0] != 12:
+                raise HTTPException(400, f"Esperado 12 derivações, recebido shape {signals.shape}.")
 
-            # Upsampling de 100Hz para 500Hz se necessário (heurística: se duração for ~10s a 100Hz = 1000 pontos)
-            # O CODE-15% espera 5000 pontos (10s @ 500Hz).
-            if signals.shape[1] < 2000:  # Provavelmente 100Hz ou menos
-                # Upsample por fator de 5 (100 -> 500)
-                signals = scipy_signal.resample(signals, 5000, axis=1)
-            elif signals.shape[1] != 5000:
-                # Se não for exatamente 5000, resample para 5000
-                signals = scipy_signal.resample(signals, 5000, axis=1)
+            resultado = m.predict(signals, sr=req.sr)
+            if "erro" in resultado:
+                # Modelo indisponível é 503; entrada inválida é 400.
+                codigo = 503 if resultado.get("modelo") == "code15_unavailable" else 400
+                raise HTTPException(codigo, resultado["erro"])
 
-            resultado = m.predict(signals)
             resultado["timestamp"] = _ts()
             return {"resultado": resultado, "aviso": DISCLAIMER_CFM}
 

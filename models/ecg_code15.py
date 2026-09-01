@@ -243,7 +243,12 @@ class ECGCode15Predictor:
         """
         Ajusta sinal para a janela de 2934 amostras.
         Mais curto: padding centrado simétrico com zeros.
-        Mais longo: recorte CENTRAL pela máscara de validade.
+        Mais longo: recorte CENTRAL GEOMÉTRICO — (n - 2934) // 2.
+
+        NÃO é recorte por máscara de validade: nenhuma máscara é calculada
+        aqui. Coincide com o centro válido enquanto o padding for simétrico
+        (caso do CODE-15%, 95,9% dos exames em 581+2934+581=4096). Com
+        padding assimétrico, pode incluir amostras de padding nas bordas.
         """
         n_samples = signals.shape[-1]
         if n_samples == _JANELA:
@@ -312,7 +317,10 @@ class ECGCode15Predictor:
         # Média do ensemble
         avg_probs = np.mean(all_probs, axis=0)[0]
 
-        # Montar resultado — apenas probabilidades, sem limiar nem alerta automático
+        # Montar resultado — apenas probabilidades, sem limiar nem alerta automático.
+        # Ordem POSICIONAL FIXA de CODE15_CLASSES, conforme contrato. NÃO ranquear:
+        # consumidor que indexe por posição depende dela, e ordenar por
+        # probabilidade insinua um "achado principal" que não foi calibrado.
         resultados = []
         for i, cls in enumerate(CODE15_CLASSES):
             resultados.append({
@@ -320,8 +328,6 @@ class ECGCode15Predictor:
                 "classe_pt": CODE15_CLASSES_PT[cls],
                 "probabilidade": round(float(avg_probs[i]), 4),
             })
-
-        resultados.sort(key=lambda x: -x["probabilidade"])
 
         return {
             "modelo": "code15_resnet1d_ensemble_faseB18",
