@@ -624,11 +624,21 @@ class AldoraAI:
             predictor = load_ecg_code15()
             if predictor.loaded:
                 self.registry["ecg_code15"] = predictor
-                self._log.info("ECG CODE-15% carregado (%d folds).", len(predictor.models))
+                self._log.info("ECG CODE-15%% carregado (%d folds).", len(predictor.models))
             else:
-                self._log.warning("ECG CODE-15% não carregado (pesos ausentes?).")
+                # _load_models() do módulo SEMPRE levanta exceção em falha —
+                # nunca retorna com loaded=False sem raise. Ramo teoricamente
+                # inalcançável; se for alcançado, é bug no módulo ecg_code15.py.
+                self._log.error("ECG CODE-15%: loaded=False sem exceção — bug no módulo.")
+        except FileNotFoundError as e:
+            # Pesos confirmados no volume por medição em 01/09/2026 (5 folds:
+            # code15_faseB18_fold0..4.pt, via modal-reader:volume_ls). Se este
+            # erro ainda aparecer, é falha real de path ou montagem do volume,
+            # não ausência de peso. Traceback completo, nunca warning de uma
+            # linha — família "a falha fabrica" (AHS-63/67/71).
+            self._log.exception("ECG CODE-15%%: pesos ausentes apesar da medição prévia: %s", e)
         except Exception as e:
-            self._log.warning("ECG CODE-15% indisponível: %s", e)
+            self._log.exception("ECG CODE-15%%: falha inesperada no carregamento: %s", e)
 
         # Derma — EfficientNet-B4 HAM10000
         try:
