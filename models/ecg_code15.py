@@ -66,75 +66,53 @@ _JANELA = 2934
 _NUM_CLASSES = 6
 
 
-class ResNetBlock1D(nn.Module):
-    """Bloco residual 1D para ECG."""
-    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
-        super().__init__()
-        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=17, stride=stride, padding=8, bias=False)
-        self.bn1 = nn.BatchNorm1d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=17, stride=1, padding=8, bias=False)
-        self.bn2 = nn.BatchNorm1d(out_channels)
-
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm1d(out_channels),
-            )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += self.shortcut(x)
-        out = self.relu(out)
-        return out
-
-
 class ECGCode15Model(nn.Module):
     """
-    ResNet adaptada para CODE-15%.
+    Arquitetura FIEL à treinada em ahs74_ecg_code15_faseB18.ipynb, célula 10
+    (classe `ResNet1D` no notebook). Apesar do nome, NÃO tem conexão residual
+    — é puramente sequencial: stem -> 4 blocos (conv-bn-relu-dropout-conv-bn-
+    -relu) -> head. Os nomes de atributo (stem, b, head) são exigidos pelo
+    load_state_dict(strict=True) contra os pesos salvos — NÃO renomear nem
+    "simplificar" para nomenclatura torchvision-style. Isso já causou uma
+    incompatibilidade de arquitetura silenciosa (AHS-77): a versão anterior
+    desta classe usava conv1/bn1/layer1-4/fc com shortcut residual, uma
+    arquitetura diferente da que gerou os pesos.
     Input: (batch, 12, 2934) — 12 leads, janela de 2934 amostras a 400 Hz.
     Output: (batch, 6) logits.
     """
-    def __init__(self, num_classes: int = _NUM_CLASSES):
+    def __init__(self, num_classes: int = _NUM_CLASSES, ch: int = 64):
         super().__init__()
-        self.in_channels = 64
+        self.stem = nn.Sequential(
+            nn.Conv1d(12, ch, kernel_size=17, stride=2, padding=8),
+            nn.BatchNorm1d(ch),
+            nn.ReLU(),
+        )
 
-        self.conv1 = nn.Conv1d(12, 64, kernel_size=15, stride=2, padding=7, bias=False)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+        def _bloco(i: int, o: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.Conv1d(i, o, kernel_size=17, stride=2, padding=8),
+                nn.BatchNorm1d(o),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Conv1d(o, o, kernel_size=17, stride=1, padding=8),
+                nn.BatchNorm1d(o),
+                nn.ReLU(),
+            )
 
-        self.layer1 = self._make_layer(64, 2, stride=1)
-        self.layer2 = self._make_layer(128, 2, stride=2)
-        self.layer3 = self._make_layer(256, 2, stride=2)
-        self.layer4 = self._make_layer(512, 2, stride=2)
-
-        self.avgpool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Linear(512, num_classes)
-
-    def _make_layer(self, out_channels: int, num_blocks: int, stride: int) -> nn.Sequential:
-        strides = [stride] + [1] * (num_blocks - 1)
-        layers = []
-        for s in strides:
-            layers.append(ResNetBlock1D(self.in_channels, out_channels, s))
-            self.in_channels = out_channels
-        return nn.Sequential(*layers)
+        self.b = nn.Sequential(
+            _bloco(ch, 128),
+            _bloco(128, 196),
+            _bloco(196, 256),
+            _bloco(256, 320),
+        )
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(320, num_classes),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        x = self.fc(x)
-        return x
+        return self.head(self.b(self.stem(x)))
 
 
 class ECGCode15Predictor:
@@ -211,9 +189,12 @@ class ECGCode15Predictor:
             # strict=True (padrão) já garante isso; load_state_dict falha
             # se houver mismatch. NUNCA usar strict=False.
             model.load_state_dict(new_state_dict)
-            assert model.fc.out_features == _NUM_CLASSES, (
-                f"[ECG-CODE15] Gate de cardinalidade falhou: fc.out_features="
-                f"{model.fc.out_features}, esperado {_NUM_CLASSES}. "
+            # Linear final vive em model.head[2] (Sequential: [0]=AvgPool,
+            # [1]=Flatten, [2]=Linear) — não existe mais model.fc nesta
+            # arquitetura. Ver docstring de ECGCode15Model.
+            assert model.head[2].out_features == _NUM_CLASSES, (
+                f"[ECG-CODE15] Gate de cardinalidade falhou: head[2].out_features="
+                f"{model.head[2].out_features}, esperado {_NUM_CLASSES}. "
                 "Pesos incompatíveis com o contrato."
             )
 
