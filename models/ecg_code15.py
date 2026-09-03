@@ -65,6 +65,35 @@ _SR_NATIVO = 400
 _JANELA = 2934
 _NUM_CLASSES = 6
 
+# ── Escala de amplitude do treino ─────────────────────────────────────────────
+# Mediana do IQR por derivacao da fase B. NAO e valor novo: e o MESMO
+# vetor que o preprocess usa, transcrito do contrato
+# ecg_code15_faseB18_contrato.json e auditado 24/24 na AHS-76.
+# ⚠️ DIVIDA DECLARADA: e COPIA, nao leitura. Se o contrato mudar, este
+# modulo nao percebe. Fechar publicando o contrato no repositorio
+# (models/ecg_code15_faseB18_contrato.json) — rodada separada, para nao
+# misturar alteracao de imagem com alteracao de inferencia.
+_IQR_TREINO = float(np.median(_NORM_IQR))  # 0.3660
+
+# ── Limiar de produção ────────────────────────────────────────────────────────
+# Limiar de producao — calibrado no PTB-XL 1.0.3 strat_fold 9 (Youden) e
+# CONFIRMADO SEM REAJUSTE no strat_fold 10 (AHS-77). Substitui o limiar de
+# POTENCIAL da fase B, que fora calibrado no mesmo conjunto que mediu o
+# modelo. Dossie: dossie_treinamento/ahs77_validacao_completa_ecg.json
+_LIMIAR_PRODUCAO = {
+    "1dAVb": 0.0588, "RBBB": 0.0810, "LBBB": 0.1572,
+    "SB": 0.0090, "ST": 0.1561, "AF": 0.0406,
+}
+# sens/espec/VPP medidos no fold 10 (conjunto nunca usado para calibrar)
+_DESEMPENHO_LIMIAR = {
+    "1dAVb": {"sens": 0.8734, "espec": 0.9198, "vpp": 0.2887},
+    "RBBB":  {"sens": 1.0000, "espec": 0.9739, "vpp": 0.4909},
+    "LBBB":  {"sens": 0.9815, "espec": 0.9846, "vpp": 0.6163},
+    "SB":    {"sens": 0.6719, "espec": 0.9653, "vpp": 0.3675},
+    "ST":    {"sens": 0.9634, "espec": 0.9754, "vpp": 0.6031},
+    "AF":    {"sens": 0.9211, "espec": 0.9673, "vpp": 0.6763},
+}
+
 
 class ECGCode15Model(nn.Module):
     """
@@ -220,6 +249,27 @@ class ECGCode15Predictor:
         return torch.tensor(normalized, dtype=torch.float32).to(self.device)
 
     @staticmethod
+    def _normaliza_amplitude(signals: np.ndarray, iqr_treino: float) -> tuple[np.ndarray, float]:
+        """
+        Reescala a amplitude para casar o IQR do sinal com o IQR do TREINO.
+
+        ⛔ DERIVADA do contrato, nao escolhida pelo placar (AHS-72/73). O modelo
+        NAO e invariante a amplitude: medido na AHS-77, o AUC do AF varia de
+        0,6199 a 0,8836 no MESMO sinal, so mudando a escala. Sem isto, hospital
+        que envie em uV ou em unidades de ADC recebe inferencia pior EM SILENCIO.
+
+        Devolve (sinal reescalado, fator aplicado). Fator 1.0 quando o IQR e
+        degenerado — nao ha o que casar, e multiplicar por infinito seria pior.
+        """
+        iqr = float(np.median([
+            np.subtract(*np.percentile(signals[c], [75, 25])) for c in range(signals.shape[0])
+        ]))
+        if iqr <= 1e-9:
+            return signals, 1.0
+        fator = iqr_treino / iqr
+        return signals * fator, fator
+
+    @staticmethod
     def _adjust_window(signals: np.ndarray) -> np.ndarray:
         """
         Ajusta sinal para a janela de 2934 amostras, pelo contrato da fase B:
@@ -315,6 +365,11 @@ class ECGCode15Predictor:
                 "modelo": "code15_shape_error",
             }
 
+        # Normalizacao de amplitude — DEPOIS do ajuste de janela (o IQR deve ser
+        # medido no trecho valido, nao no padding) e ANTES do preprocess, que
+        # aplica os vetores fixos da fase B assumindo a escala do treino.
+        signals_np, fator_amplitude = self._normaliza_amplitude(signals_np, _IQR_TREINO)
+
         input_tensor = self.preprocess(signals_np)
 
         all_probs = []
@@ -334,10 +389,17 @@ class ECGCode15Predictor:
         # probabilidade insinua um "achado principal" que não foi calibrado.
         resultados = []
         for i, cls in enumerate(CODE15_CLASSES):
+            prob = round(float(avg_probs[i]), 4)
             resultados.append({
                 "classe": cls,
                 "classe_pt": CODE15_CLASSES_PT[cls],
-                "probabilidade": round(float(avg_probs[i]), 4),
+                "probabilidade": prob,
+                # O limiar é DEVOLVIDO, nunca aplicado: quem decide é o
+                # consumidor. Nenhum alerta automático é emitido aqui.
+                "limiar_producao": _LIMIAR_PRODUCAO[cls],
+                "acima_do_limiar": bool(prob >= _LIMIAR_PRODUCAO[cls]),
+                "sens_no_limiar": _DESEMPENHO_LIMIAR[cls]["sens"],
+                "vpp_no_limiar": _DESEMPENHO_LIMIAR[cls]["vpp"],
             })
 
         return {
@@ -345,6 +407,11 @@ class ECGCode15Predictor:
             "dataset": "CODE-15% (UFMG/Telehealth)",
             "sr_nativo": _SR_NATIVO,
             "janela": _JANELA,
+            "fator_amplitude": round(fator_amplitude, 4),
+            "limiar_origem": "PTB-XL 1.0.3 fold 9 (Youden), confirmado no fold 10 sem reajuste — AHS-77",
+            "aviso_vpp": ("VPP medio de 0,51 na prevalencia de validacao: cerca de "
+                          "metade dos alertas acima do limiar sao falsos positivos. "
+                          "O limiar ordena, nao decide."),
             "resultados": resultados,
             "disclaimer": (
                 "Resultado gerado por IA (CODE-15%) como apoio à decisão clínica. "
