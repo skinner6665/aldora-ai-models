@@ -222,26 +222,56 @@ class ECGCode15Predictor:
     @staticmethod
     def _adjust_window(signals: np.ndarray) -> np.ndarray:
         """
-        Ajusta sinal para a janela de 2934 amostras.
-        Mais curto: padding centrado simétrico com zeros.
-        Mais longo: recorte CENTRAL GEOMÉTRICO — (n - 2934) // 2.
+        Ajusta sinal para a janela de 2934 amostras, pelo contrato da fase B:
+        recorte central PELA MASCARA DE VALIDADE.
 
-        NÃO é recorte por máscara de validade: nenhuma máscara é calculada
-        aqui. Coincide com o centro válido enquanto o padding for simétrico
-        (caso do CODE-15%, 95,9% dos exames em 581+2934+581=4096). Com
-        padding assimétrico, pode incluir amostras de padding nas bordas.
+        O contrato (ecg_code15_faseB18_contrato.json) declara:
+            "recorte": "CENTRAL pela mascara de validade"
+
+        Antes desta correcao o recorte era geometrico — (n - 2934) // 2 — o que
+        coincide com o centro valido apenas quando o padding e simetrico (95,9%
+        do CODE-15%). Medido na AHS-77 com padding assimetrico, 60 casos:
+        LBBB divergiu ate 0,300153 entre os dois recortes, e a divergencia
+        cresce com a assimetria (pior nos extremos frac=0,00 e frac=1,00).
+        ECG de eletrocardiografo real nao tem padding simetrico.
+
+        Estrategia:
+          1. mascara de validade = colunas com qualquer |amplitude| > tol
+          2. recorta ao intervalo valido [ini, fim)
+          3. curto  -> padding centrado simetrico com zeros
+             longo  -> recorte central DENTRO do intervalo valido
+          4. sinal todo nulo -> cai para o comportamento geometrico, que e o
+             unico definido nesse caso (e nao ha informacao a preservar)
         """
         n_samples = signals.shape[-1]
-        if n_samples == _JANELA:
-            return signals
-        if n_samples < _JANELA:
-            pad_total = _JANELA - n_samples
+
+        # 1) mascara de validade
+        tol = 1e-8
+        valido = np.any(np.abs(signals) > tol, axis=0)
+
+        if not valido.any():
+            # Sinal integralmente nulo: nada a centralizar. Mantem o
+            # comportamento geometrico, deterministico.
+            nucleo = signals
+        else:
+            ini = int(np.argmax(valido))
+            fim = int(len(valido) - np.argmax(valido[::-1]))
+            nucleo = signals[..., ini:fim]
+
+        n_valido = nucleo.shape[-1]
+
+        if n_valido == _JANELA:
+            return nucleo
+
+        if n_valido < _JANELA:
+            pad_total = _JANELA - n_valido
             pad_left = pad_total // 2
             pad_right = pad_total - pad_left
-            return np.pad(signals, ((0, 0), (pad_left, pad_right)), mode="constant", constant_values=0)
-        # Mais longo: recorte central
-        start = (n_samples - _JANELA) // 2
-        return signals[..., start:start + _JANELA]
+            return np.pad(nucleo, ((0, 0), (pad_left, pad_right)), mode="constant", constant_values=0)
+
+        # Mais longo que a janela: recorte central DENTRO do trecho valido
+        start = (n_valido - _JANELA) // 2
+        return nucleo[..., start:start + _JANELA]
 
     def predict(self, signals: list[list[float]] | np.ndarray, sr: float | None = None) -> dict:
         """
